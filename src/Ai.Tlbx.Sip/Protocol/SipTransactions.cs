@@ -40,12 +40,11 @@ internal sealed class SipTransactions(SipClientConfig config, TimeProvider time)
     public async Task<SipMessage> SendAsync(SipMessage request, SipTransport transport,
         Action<SipMessage>? progress, CancellationToken cancellationToken)
     {
-        using var deadline = new CancellationTokenSource();
-        using var timer = time.CreateTimer(_ => deadline.Cancel(), null, config.TransactionTimeout, Timeout.InfiniteTimeSpan);
+        using var deadline = new CancellationTokenSource(config.TransactionTimeout, time);
         var pending = new Pending
         {
             Progress = progress, CallId = request.Get("Call-ID"), FromTag = SipMessage.Parameter(request.Get("From"), "tag"),
-            StartAnswerTimer = request.Method == "INVITE" ? () => timer.Change(config.CallAnswerTimeout, Timeout.InfiniteTimeSpan) : null
+            StartAnswerTimer = request.Method == "INVITE" ? () => deadline.CancelAfter(config.CallAnswerTimeout) : null
         };
         string key = request.TransactionKey;
         if (!_pending.TryAdd(key, pending)) throw new InvalidOperationException("Duplicate SIP transaction.");
