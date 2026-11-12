@@ -19,6 +19,7 @@ public sealed class SipCall : IAsyncDisposable
     private string[] _routes = [];
     private int _remoteSequence = -1;
     private Task? _dialTask;
+    private Task? _hangupTask;
     private bool _ending;
     private readonly Dictionary<string, Task> _closingDialogs = [];
     private SipCall(SipClient client, string id, SipCallDirection direction, string remote)
@@ -71,7 +72,8 @@ public sealed class SipCall : IAsyncDisposable
             var response = await _client.RequestAuthenticatedAsync(_invite, p =>
             {
                 if (p.StatusCode >= 200) _lastResponse = p;
-                if (p.StatusCode is 180 or 183 && Status.State == SipCallState.Calling) SetStatus(SipCallState.Ringing, p.StatusCode);
+                lock (_gate)
+                    if (p.StatusCode is 180 or 183 && !_ending && Status.State == SipCallState.Calling) SetStatus(SipCallState.Ringing, p.StatusCode);
             }, linked.Token);
             if (response.StatusCode >= 300)
             {
@@ -82,15 +84,19 @@ public sealed class SipCall : IAsyncDisposable
             }
             SetRemoteDialog(response);
             await AckAsync(response);
-            if (Status.State == SipCallState.Ended) return;
-            if (_ending || linked.IsCancellationRequested)
+            var session = SdpSession.Parse(response.Body, _client.Config.MediaSecurity);
+            bool cancel;
+            lock (_gate)
+            {
+                if (Status.State == SipCallState.Ended) return;
+                cancel = _ending || linked.IsCancellationRequested;
+                if (!cancel) { Audio.Start(session); SetStatus(SipCallState.Established, response.StatusCode); }
+            }
+            if (cancel)
             {
                 await SendByeAsync(CancellationToken.None); await EndAsync(SipCallEndReason.Cancelled);
                 throw new OperationCanceledException(linked.Token);
             }
-            var session = SdpSession.Parse(response.Body, _client.Config.MediaSecurity);
-            Audio.Start(session);
-            SetStatus(SipCallState.Established, response.StatusCode);
         }
         catch (OperationCanceledException)
         {
@@ -137,8 +143,11 @@ public sealed class SipCall : IAsyncDisposable
                 await _client.SendAsync(_answer, linked.Token);
                 interval = TimeSpan.FromMilliseconds(Math.Min(interval.TotalMilliseconds * 2, 4000));
             }
-            if (_stop.IsCancellationRequested) return;
-            Audio.Start(remote); SetStatus(SipCallState.Established, 200);
+            lock (_gate)
+            {
+                if (_stop.IsCancellationRequested || _ending) return;
+                Audio.Start(remote); SetStatus(SipCallState.Established, 200);
+            }
         }
         catch (Exception error)
         {
@@ -156,26 +165,42 @@ public sealed class SipCall : IAsyncDisposable
             if (statusCode is < 400 or > 699) throw new ArgumentOutOfRangeException(nameof(statusCode));
             SetStatus(SipCallState.Ending);
         }
-        await _client.ReplyAsync(_invite!, SipMessage.Response(_invite!, statusCode, statusCode == 486 ? "Busy Here" : "Decline", _localTag), cancellationToken);
-        await EndAsync(SipCallEndReason.Rejected, statusCode);
+        try { await _client.ReplyAsync(_invite!, SipMessage.Response(_invite!, statusCode, statusCode == 486 ? "Busy Here" : "Decline", _localTag), cancellationToken); }
+        finally { await EndAsync(SipCallEndReason.Rejected, statusCode); }
     }
-    public async Task HangupAsync(CancellationToken cancellationToken = default)
+    public Task HangupAsync(CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        // Caller cancellation only stops waiting; the call still owns bounded wire cleanup.
+        lock (_gate) return (_hangupTask ??= HangupCoreAsync()).WaitAsync(cancellationToken);
+    }
+    private async Task HangupCoreAsync()
     {
         SipCallState state;
-        lock (_gate) { state = Status.State; if (state == SipCallState.Ended || _ending) return; _ending = true; }
+        bool alreadyEnding;
+        lock (_gate)
+        {
+            state = Status.State; alreadyEnding = state is SipCallState.Ended or SipCallState.Ending || _ending;
+            _ending = true;
+        }
+        if (alreadyEnding) { await Completion; return; }
         if (state == SipCallState.Created) { await EndAsync(SipCallEndReason.Cancelled); return; }
-        if (state == SipCallState.Incoming) { await RejectAsync(603, cancellationToken); return; }
+        if (state == SipCallState.Incoming) { await RejectAsync(603); return; }
         if (state is SipCallState.Calling or SipCallState.Ringing)
         {
             _dialCancellation.Cancel();
-            if (_dialTask is not null) try { await _dialTask.WaitAsync(cancellationToken); }
-                catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested) { }
+            if (_dialTask is not null) try { await _dialTask; }
+                catch (OperationCanceledException) { }
                 catch (SipException e) when (e.StatusCode == 487) { }
             return;
         }
-        if (state == SipCallState.Answering) { await _ack.Task.WaitAsync(cancellationToken); }
-        SetStatus(SipCallState.Ending);
-        try { await SendByeAsync(cancellationToken); }
+        if (state == SipCallState.Answering) await Task.WhenAny(_ack.Task, Completion);
+        lock (_gate)
+        {
+            if (Status.State != SipCallState.Ended) SetStatus(SipCallState.Ending);
+        }
+        if (Status.State == SipCallState.Ended) { await Completion; return; }
+        try { await SendByeAsync(CancellationToken.None); }
         finally { await EndAsync(SipCallEndReason.LocalHangup); }
     }
     private Task SendByeAsync(CancellationToken cancellationToken)
@@ -262,11 +287,16 @@ public sealed class SipCall : IAsyncDisposable
     }
     internal async Task EndAsync(SipCallEndReason reason, int? code = null, string? error = null)
     {
+        bool ownsCleanup;
         lock (_gate)
         {
-            if (Status.State == SipCallState.Ended) return;
-            _stop.Cancel(); SetStatus(SipCallState.Ended, code, reason, error); _client.Forget(this);
+            ownsCleanup = Status.State != SipCallState.Ended;
+            if (ownsCleanup)
+            {
+                _stop.Cancel(); SetStatus(SipCallState.Ended, code, reason, error); _client.Forget(this);
+            }
         }
+        if (!ownsCleanup) { await Completion; return; }
         await Audio.DisposeAsync(); _completion.TrySetResult(Status); Publish(Ended, Status);
     }
     private void SetStatus(SipCallState state, int? code = null, SipCallEndReason? reason = null, string? error = null)

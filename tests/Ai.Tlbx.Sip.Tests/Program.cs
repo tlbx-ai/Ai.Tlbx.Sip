@@ -313,6 +313,41 @@ var cases = new (string Name, Func<Task> Run)[]
             await call.HangupAsync(); await client.DisconnectAsync();
         }
     }),
+    ("Hangup finishes when an incoming answer receives no ACK", async () =>
+    {
+        await using var pbx = new TestPbx(); await using var manager = new SipClientManager();
+        var client = manager.CreateClient(Check.Config(pbx.Port, transactionTimeout: TimeSpan.FromMilliseconds(400)));
+        await client.ConnectAsync();
+        var incoming = new TaskCompletionSource<SipCall>(TaskCreationOptions.RunContinuationsAsynchronously);
+        client.IncomingCall += (_, call) => incoming.TrySetResult(call);
+        await pbx.InviteAsync(); var call = await incoming.Task.WaitAsync(TimeSpan.FromSeconds(3));
+        var answering = call.AnswerAsync(); await pbx.WaitResponseAsync("INVITE", 200);
+        var hanging = call.HangupAsync(); var secondHangup = call.HangupAsync();
+        try { await answering; throw new Exception("Missing ACK did not time out."); }
+        catch (OperationCanceledException) { }
+        await Task.WhenAll(hanging, secondHangup).WaitAsync(TimeSpan.FromSeconds(2));
+        Check.That(call.Completion.IsCompletedSuccessfully && call.Status.EndReason == SipCallEndReason.Timeout);
+        Check.That(client.Calls.Count == 0 && !call.Audio.TryWrite(new short[480], 24000));
+        await client.DisconnectAsync();
+    }),
+    ("Cancelling a hangup waiter preserves ACK/BYE cleanup", async () =>
+    {
+        await using var pbx = new TestPbx(); await using var manager = new SipClientManager();
+        var client = manager.CreateClient(Check.Config(pbx.Port)); await client.ConnectAsync();
+        var incoming = new TaskCompletionSource<SipCall>(TaskCreationOptions.RunContinuationsAsynchronously);
+        client.IncomingCall += (_, call) => incoming.TrySetResult(call);
+        var invite = await pbx.InviteAsync(); var call = await incoming.Task.WaitAsync(TimeSpan.FromSeconds(3));
+        var answering = call.AnswerAsync(); var answer = await pbx.WaitResponseAsync("INVITE", 200);
+        using var cancellation = new CancellationTokenSource();
+        var hanging = call.HangupAsync(cancellation.Token); cancellation.Cancel();
+        try { await hanging; throw new Exception("Hangup waiter ignored cancellation."); }
+        catch (OperationCanceledException) { }
+        await pbx.AckAsync(invite, answer);
+        await Task.WhenAll(answering, call.HangupAsync()).WaitAsync(TimeSpan.FromSeconds(3));
+        Check.That(call.Completion.IsCompletedSuccessfully && call.Status.EndReason == SipCallEndReason.LocalHangup);
+        Check.That(pbx.ByeRequests == 1 && !call.Audio.TryWrite(new short[480], 24000));
+        await client.DisconnectAsync();
+    }),
     ("Incoming call event, duplicate INVITE, answer, ACK and remote BYE", async () =>
     {
         await using var pbx = new TestPbx(); await using var manager = new SipClientManager();

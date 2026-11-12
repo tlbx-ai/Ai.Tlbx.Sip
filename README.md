@@ -90,6 +90,8 @@ await incomingCall.AnswerAsync();
 
 Observe `call.Completion` to wait for final teardown. A retained call object keeps its final status after it has been removed from the client's active collection. Disconnecting a client ends its calls.
 
+Concurrent `HangupAsync` callers share teardown. Cancelling a hangup wait does not abandon the call's protocol cleanup. If an incoming answer never receives ACK, the transaction timeout ends the call and releases hangup waiters.
+
 ## Exchange PCM audio
 
 Audio frames contain owned PCM16 mono samples, their sample rate, and their stream position. The default application-facing sample rate is 24 kHz.
