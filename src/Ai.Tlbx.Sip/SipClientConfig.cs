@@ -34,6 +34,7 @@ public sealed class SipClientConfig
     public int RegistrationLifetimeSeconds { get; init; } = 300;
     public TimeSpan KeepAliveInterval { get; init; } = TimeSpan.FromSeconds(25);
     public TimeSpan TransactionTimeout { get; init; } = TimeSpan.FromSeconds(32);
+    public TimeSpan CallAnswerTimeout { get; init; } = TimeSpan.FromMinutes(2);
     public TimeSpan InitialRetransmitInterval { get; init; } = TimeSpan.FromMilliseconds(500);
     public TimeSpan ReconnectDelay { get; init; } = TimeSpan.FromSeconds(3);
     public bool AutoReconnect { get; init; } = true;
@@ -57,7 +58,7 @@ public sealed class SipClientConfig
                 throw new ArgumentException("SIP configuration contains invalid characters.");
         if (ServerPort is < 1 or > 65535 || LocalPort is < 0 or > 65535 || MaxConcurrentCalls < 1 ||
             RegistrationLifetimeSeconds < 30 || AudioSampleRate is < 8000 or > 96000 ||
-            KeepAliveInterval <= TimeSpan.Zero || TransactionTimeout <= TimeSpan.Zero ||
+            KeepAliveInterval <= TimeSpan.Zero || TransactionTimeout <= TimeSpan.Zero || CallAnswerTimeout <= TimeSpan.Zero ||
             InitialRetransmitInterval <= TimeSpan.Zero || ReconnectDelay <= TimeSpan.Zero ||
             MaxQueuedAudio < TimeSpan.FromMilliseconds(20) || MaxQueuedAudio > TimeSpan.FromMinutes(1))
             throw new ArgumentOutOfRangeException(nameof(SipClientConfig));

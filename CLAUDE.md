@@ -8,5 +8,6 @@ Keep all audio, jitter and transaction buffers bounded. Preserve resampler/codec
 
 Run the executable protocol/media tests on Windows and Linux after relevant changes. Keep mock tests, real PBX registration, real call/audio acceptance, GitHub publication and NuGet publication distinct in reports and the README.
 Media regressions must cover early RTP before the final answer, bounded recovery from bursts, and speech resuming after silence suppression. RTP sequence numbers advance per transmitted packet, never per playout tick.
+Call cancellation must complete the remote protocol cleanup, including a racing answer and repeated final responses. A completed readiness task from an earlier connection must never satisfy ConnectAsync while reconnecting or after registration expiry.
 
 Never commit credentials, live phone numbers, private PBX traces or audio recordings. Test configuration belongs outside the checkout. Public documentation is English. Update `Agents.md` and `CLAUDE.md` together.

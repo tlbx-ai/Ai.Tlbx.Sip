@@ -2,19 +2,22 @@ using System.Net;
 using System.Net.Security;
 using System.Net.Sockets;
 using System.Security.Authentication;
+using System.Security.Cryptography.X509Certificates;
 
 namespace Ai.Tlbx.Sip.Protocol;
 
 internal sealed class SipTransport : IAsyncDisposable
 {
     private readonly SipClientConfig _config;
+    private readonly X509Certificate2Collection? _testTrustRoots;
     private readonly SemaphoreSlim _sendLock = new(1, 1);
     private Socket? _socket;
     private Stream? _stream;
     public IPEndPoint LocalEndPoint => (IPEndPoint)(_socket?.LocalEndPoint ?? throw new InvalidOperationException("Transport is closed."));
     public IPEndPoint RemoteEndPoint => (IPEndPoint)(_socket?.RemoteEndPoint ?? throw new InvalidOperationException("Transport is closed."));
     public bool IsReliable => _config.Transport != SipTransportProtocol.Udp;
-    public SipTransport(SipClientConfig config) => _config = config;
+    public SipTransport(SipClientConfig config, X509Certificate2Collection? testTrustRoots = null)
+    { _config = config; _testTrustRoots = testTrustRoots; }
     public async Task OpenAsync(CancellationToken cancellationToken)
     {
         string host = _config.OutboundProxy ?? _config.Registrar;
@@ -33,11 +36,20 @@ internal sealed class SipTransport : IAsyncDisposable
             {
                 var tls = new SslStream(_stream, leaveInnerStreamOpen: false);
                 _stream = tls;
-                await tls.AuthenticateAsClientAsync(new SslClientAuthenticationOptions
+                var options = new SslClientAuthenticationOptions
                 {
                     TargetHost = host, EnabledSslProtocols = SslProtocols.Tls12 | SslProtocols.Tls13,
-                    CertificateRevocationCheckMode = System.Security.Cryptography.X509Certificates.X509RevocationMode.Online
-                }, cancellationToken);
+                    CertificateRevocationCheckMode = X509RevocationMode.Online
+                };
+                // Internal loopback verification uses an ephemeral private CA.
+                // Production clients always use the operating system trust store.
+                if (_testTrustRoots is not null)
+                {
+                    options.CertificateChainPolicy = new X509ChainPolicy
+                    { TrustMode = X509ChainTrustMode.CustomRootTrust, RevocationMode = X509RevocationMode.NoCheck };
+                    options.CertificateChainPolicy.CustomTrustStore.AddRange(_testTrustRoots);
+                }
+                await tls.AuthenticateAsClientAsync(options, cancellationToken);
             }
         }
     }

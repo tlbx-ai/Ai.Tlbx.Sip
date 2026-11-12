@@ -89,6 +89,26 @@ var cases = new (string Name, Func<Task> Run)[]
         Check.That(manager.Clients.Count == 1 && !config.Credentials.ToString().Contains("test-password"));
         Check.That(await manager.RemoveClientAsync(config.Id)); Check.That(manager.Clients.Count == 0);
     }),
+    ("Multiple identities and concurrent call limits stay isolated", async () =>
+    {
+        await using var alicePbx = new TestPbx { Username = "alice", Password = "alice-test-password" };
+        await using var bobPbx = new TestPbx { Username = "bob", Password = "bob-test-password" };
+        await using var manager = new SipClientManager();
+        var alice = manager.CreateClient(Check.Config(alicePbx.Port, id: "alice", credentials: new() { Username = "alice", Password = "alice-test-password" }));
+        var bob = manager.CreateClient(Check.Config(bobPbx.Port, id: "bob", credentials: new() { Username = "bob", Password = "bob-test-password" }));
+        await Task.WhenAll(alice.ConnectAsync(), bob.ConnectAsync());
+        var aliceCall = alice.CreateCall("123"); var bobCall = bob.CreateCall("123");
+        await Task.WhenAll(aliceCall.StartAsync(), bobCall.StartAsync());
+        await manager.RemoveClientAsync("alice");
+        Check.That(alicePbx.Unregistered && bob.Status.State == SipClientState.Connected && bobCall.Status.State == SipCallState.Established);
+        await bobCall.HangupAsync();
+        var attempts = await Task.WhenAll(Enumerable.Range(0, 16).Select(_ => Task.Run(() =>
+        {
+            try { return bob.CreateCall("123"); } catch (InvalidOperationException) { return null; }
+        })));
+        Check.That(attempts.Count(c => c is not null) == 4 && bob.Calls.Count == 4);
+        await bob.DisconnectAsync(); Check.That(bob.Calls.Count == 0);
+    }),
     ("UDP retransmission, SHA-256 authentication and unregister", async () =>
     {
         await using var pbx = new TestPbx { DropFirstRegister = true };
@@ -108,12 +128,65 @@ var cases = new (string Name, Func<Task> Run)[]
         await Task.Delay(150);
         Check.That(pbx.Unregistered && pbx.AuthenticatedRegistrations == registrations);
     }),
+    ("Expired registration cannot retain Connected while refresh hangs", async () =>
+    {
+        await using var pbx = new TestPbx { GrantedExpirySeconds = 1 }; await using var manager = new SipClientManager();
+        var client = manager.CreateClient(Check.Config(pbx.Port, keepAlive: TimeSpan.FromMilliseconds(50)));
+        await client.ConnectAsync(); var expires = client.Status.RegistrationExpiresAt;
+        pbx.DropRegistrationResponses = true;
+        await Check.EventuallyAsync(() => client.Status.State == SipClientState.Failed);
+        Check.That(DateTimeOffset.UtcNow >= expires && client.Status.Error!.Contains("expired"));
+        Check.Throws<InvalidOperationException>(() => client.CreateCall("123"));
+        await client.DisconnectAsync();
+    }),
+    ("ConnectAsync during recovery waits for fresh registration", async () =>
+    {
+        await using var pbx = new TestPbx(); await using var manager = new SipClientManager();
+        var client = manager.CreateClient(Check.Config(pbx.Port, keepAlive: TimeSpan.FromMilliseconds(40), autoReconnect: true,
+            transactionTimeout: TimeSpan.FromMilliseconds(200)));
+        await client.ConnectAsync(); pbx.DropRegistrationResponses = true;
+        await Check.EventuallyAsync(() => client.Status.State == SipClientState.Reconnecting);
+        var reconnecting = client.ConnectAsync(); await Task.Delay(70);
+        Check.That(!reconnecting.IsCompleted, "Old readiness must not satisfy a new connection wait.");
+        pbx.DropRegistrationResponses = false;
+        await reconnecting.WaitAsync(TimeSpan.FromSeconds(3)); Check.That(client.Status.State == SipClientState.Connected);
+        await client.DisconnectAsync();
+    }),
     ("TCP registration survives fragmented stream messages", async () =>
     {
         await using var pbx = new TcpTestPbx(); await using var manager = new SipClientManager();
         var client = manager.CreateClient(Check.Config(pbx.Port, SipTransportProtocol.Tcp));
         await client.ConnectAsync(); Check.That(client.Status.State == SipClientState.Connected);
         await client.DisconnectAsync(); Check.That(pbx.Unregistered);
+    }),
+    ("TLS carries SIP and rejects untrusted chains and wrong hostnames", async () =>
+    {
+        foreach (var mode in new[] { "trusted", "untrusted", "wrong-host" })
+        {
+            await using var peer = new TlsTestPeer();
+            var config = new SipClientConfig
+            {
+                Id = "tls", Registrar = mode == "wrong-host" ? "127.0.0.1" : "localhost", Port = peer.Port,
+                User = "test", Credentials = new() { Username = "test", Password = "test" }, Transport = SipTransportProtocol.Tls
+            };
+            await using var transport = new SipTransport(config, mode == "untrusted" ? null : peer.TrustRoots);
+            using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+            if (mode != "trusted")
+            {
+                try { await transport.OpenAsync(deadline.Token); throw new Exception($"TLS accepted {mode}."); }
+                catch (System.Security.Authentication.AuthenticationException) { }
+                continue;
+            }
+            await transport.OpenAsync(deadline.Token);
+            var request = new SipMessage { StartLine = "OPTIONS sip:test@localhost SIP/2.0" };
+            request.Add("Via", "SIP/2.0/TLS localhost;branch=z9hG4bKtls"); request.Add("From", "<sip:test@localhost>;tag=tls");
+            request.Add("To", "<sip:peer@localhost>"); request.Add("Call-ID", "tls-test"); request.Add("CSeq", "1 OPTIONS");
+            var received = new TaskCompletionSource<SipMessage>(TaskCreationOptions.RunContinuationsAsynchronously);
+            var reading = transport.ReceiveAsync(m => { received.TrySetResult(m); return Task.CompletedTask; }, deadline.Token);
+            await transport.SendAsync(request, deadline.Token);
+            Check.That((await received.Task.WaitAsync(deadline.Token)).StatusCode == 200);
+            try { await reading; } catch (IOException) { }
+        }
     }),
     ("Wrong credentials cannot establish Connected", async () =>
     {
@@ -141,6 +214,63 @@ var cases = new (string Name, Func<Task> Run)[]
         await adapter.StopRecordingAudio();
         await call.HangupAsync(); Check.That(call.Status.EndReason == SipCallEndReason.LocalHangup && client.Calls.Count == 0);
         Check.That(!call.Audio.TryWrite(new short[480], 24000), "A closing audio producer must safely reject a trailing frame.");
+        await client.DisconnectAsync();
+    }),
+    ("Rejected calls preserve SIP status rather than becoming cancellations", async () =>
+    {
+        await using var pbx = new TestPbx { RejectCallWith = 486 }; await using var manager = new SipClientManager();
+        var client = manager.CreateClient(Check.Config(pbx.Port)); await client.ConnectAsync(); var call = client.CreateCall("123");
+        try { await call.StartAsync(); throw new Exception("Expected SIP rejection."); }
+        catch (SipException e) { Check.That(e.StatusCode == 486); }
+        Check.That(call.Status.EndReason == SipCallEndReason.Busy);
+        await client.DisconnectAsync();
+    }),
+    ("Provisional response replaces transaction timeout with answer timeout", async () =>
+    {
+        await using var pbx = new TestPbx { WaitForCancel = true }; await using var manager = new SipClientManager();
+        var client = manager.CreateClient(Check.Config(pbx.Port, transactionTimeout: TimeSpan.FromMilliseconds(300)));
+        await client.ConnectAsync(); var call = client.CreateCall("123"); var starting = call.StartAsync();
+        await Check.EventuallyAsync(() => call.Status.State == SipCallState.Ringing); await Task.Delay(450);
+        Check.That(!starting.IsCompleted && pbx.CancelRequests == 0);
+        await pbx.AnswerOutgoingAsync(); await starting; await call.HangupAsync(); await client.DisconnectAsync();
+    }),
+    ("Cancelling StartAsync cancels the remote ringing transaction", async () =>
+    {
+        await using var pbx = new TestPbx { WaitForCancel = true }; await using var manager = new SipClientManager();
+        var client = manager.CreateClient(Check.Config(pbx.Port)); await client.ConnectAsync();
+        using var cancelled = new CancellationTokenSource(); var call = client.CreateCall("123"); var starting = call.StartAsync(cancelled.Token);
+        await Check.EventuallyAsync(() => call.Status.State == SipCallState.Ringing);
+        cancelled.Cancel();
+        try { await starting; throw new Exception("Expected cancellation."); } catch (OperationCanceledException) { }
+        await Check.EventuallyAsync(() => pbx.CancelRequests == 1 && pbx.AckRequests >= 1);
+        Check.That(pbx.CancelMatchesInvite && call.Status.EndReason == SipCallEndReason.Cancelled);
+        await client.DisconnectAsync();
+    }),
+    ("Hangup waits for provisional response; late final retransmits are ACKed", async () =>
+    {
+        await using var pbx = new TestPbx { WaitForCancel = true, HoldProvisional = true }; await using var manager = new SipClientManager();
+        var client = manager.CreateClient(Check.Config(pbx.Port)); await client.ConnectAsync();
+        var call = client.CreateCall("123"); var starting = call.StartAsync(); await pbx.InviteReceived.Task;
+        var hanging = call.HangupAsync(); await Task.Delay(80);
+        Check.That(pbx.CancelRequests == 0, "CANCEL must wait for a provisional response.");
+        await pbx.SendProvisionalAsync(); await hanging.WaitAsync(TimeSpan.FromSeconds(3));
+        try { await starting; } catch (OperationCanceledException) { } catch (SipException e) when (e.StatusCode == 487) { }
+        await Check.EventuallyAsync(() => pbx.AckRequests == 1);
+        await pbx.RepeatFinalAsync(); await Check.EventuallyAsync(() => pbx.AckRequests == 2);
+        Check.That(pbx.CancelRequests == 1 && pbx.CancelMatchesInvite);
+        await client.DisconnectAsync();
+    }),
+    ("An answer racing cancellation is ACKed and closed with BYE", async () =>
+    {
+        await using var pbx = new TestPbx { WaitForCancel = true, AnswerOnCancel = true }; await using var manager = new SipClientManager();
+        var client = manager.CreateClient(Check.Config(pbx.Port)); await client.ConnectAsync();
+        using var cancelled = new CancellationTokenSource(); var call = client.CreateCall("123"); var starting = call.StartAsync(cancelled.Token);
+        await Check.EventuallyAsync(() => call.Status.State == SipCallState.Ringing); cancelled.Cancel();
+        try { await starting; throw new Exception("Expected cancellation."); } catch (OperationCanceledException) { }
+        await Check.EventuallyAsync(() => pbx.AckRequests >= 1 && pbx.ByeRequests == 1);
+        await pbx.RepeatFinalAsync(); await Check.EventuallyAsync(() => pbx.AckRequests >= 2);
+        Check.That(pbx.ByeRequests == 1, "Repeated acceptance must not create duplicate BYE transactions.");
+        Check.That(call.Status.State == SipCallState.Ended && client.Calls.Count == 0);
         await client.DisconnectAsync();
     }),
     ("Early RTP is discarded and speech resumes after silence suppression", async () =>
@@ -213,15 +343,21 @@ Environment.ExitCode = failed == 0 ? 0 : 1;
 
 internal static class Check
 {
+    public static async Task EventuallyAsync(Func<bool> condition)
+    {
+        using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+        while (!condition()) await Task.Delay(10, deadline.Token);
+    }
     public static void That(bool condition, string? message = null) { if (!condition) throw new Exception(message ?? "Assertion failed."); }
     public static void Throws<T>(Action action) where T : Exception
     { try { action(); } catch (T) { return; } throw new Exception($"Expected {typeof(T).Name}"); }
-    public static SipClientConfig Config(int port, SipTransportProtocol transport = SipTransportProtocol.Udp, TimeSpan? keepAlive = null) => new()
+    public static SipClientConfig Config(int port, SipTransportProtocol transport = SipTransportProtocol.Udp, TimeSpan? keepAlive = null,
+        bool autoReconnect = false, TimeSpan? transactionTimeout = null, string id = "test", SipCredentials? credentials = null) => new()
     {
-        Id = "test", Registrar = "127.0.0.1", Port = port, User = "test-user", Domain = "example.test", Transport = transport,
-        Credentials = new() { Username = "test-user", Password = "test-password" }, LocalAddress = IPAddress.Loopback,
-        AutoReconnect = false, TransactionTimeout = TimeSpan.FromSeconds(2), InitialRetransmitInterval = TimeSpan.FromMilliseconds(50),
-        KeepAliveInterval = keepAlive ?? TimeSpan.FromSeconds(25)
+        Id = id, Registrar = "127.0.0.1", Port = port, User = credentials?.Username ?? "test-user", Domain = "example.test", Transport = transport,
+        Credentials = credentials ?? new() { Username = "test-user", Password = "test-password" }, LocalAddress = IPAddress.Loopback,
+        AutoReconnect = autoReconnect, TransactionTimeout = transactionTimeout ?? TimeSpan.FromSeconds(2), InitialRetransmitInterval = TimeSpan.FromMilliseconds(50),
+        KeepAliveInterval = keepAlive ?? TimeSpan.FromSeconds(25), ReconnectDelay = TimeSpan.FromMilliseconds(50)
     };
     public static byte[] Rtp(ushort sequence, uint timestamp, byte[] payload)
     {

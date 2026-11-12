@@ -17,7 +17,11 @@ public sealed class SipClient : IAsyncDisposable
     private readonly TimeProvider _time;
     private readonly SemaphoreSlim _lifecycle = new(1, 1);
     private readonly SemaphoreSlim _registration = new(1, 1);
+    private readonly object _readinessGate = new();
+    private readonly object _callsGate = new();
     private readonly ConcurrentDictionary<string, SipCall> _calls = new();
+    private readonly ConcurrentDictionary<string, (SipCall Call, DateTimeOffset Expires)> _retiredCalls = new();
+    private readonly ConcurrentDictionary<string, (SipMessage Request, DateTimeOffset Expires)> _inviteRequests = new();
     private readonly ConcurrentDictionary<string, (SipMessage Response, DateTimeOffset Expires)> _responses = new();
     private readonly DigestAuthentication _digest = new();
     private readonly SemaphoreSlim _authLock = new(1, 1);
@@ -63,7 +67,7 @@ public sealed class SipClient : IAsyncDisposable
                 _firstConnection = new(TaskCreationOptions.RunContinuationsAsynchronously);
                 _connection = ConnectionLoopAsync(_stop.Token);
             }
-            ready = _firstConnection.Task;
+            lock (_readinessGate) ready = _firstConnection.Task;
         }
         finally { _lifecycle.Release(); }
         await ready.WaitAsync(cancellationToken);
@@ -84,7 +88,7 @@ public sealed class SipClient : IAsyncDisposable
                 DateTimeOffset expires = await RegisterAsync(_config.RegistrationLifetimeSeconds, generation.Token);
                 if (Volatile.Read(ref _disconnecting)) await Task.Delay(Timeout.InfiniteTimeSpan, _time, generation.Token);
                 SetStatus(SipClientState.Connected, expires: expires);
-                previouslyConnected = true; _firstConnection.TrySetResult();
+                previouslyConnected = true;
                 while (!generation.IsCancellationRequested)
                 {
                     TimeSpan untilRefresh = TimeSpan.FromTicks((expires - _time.GetUtcNow()).Ticks * 2 / 3);
@@ -92,10 +96,17 @@ public sealed class SipClient : IAsyncDisposable
                     await Task.Delay(delay > TimeSpan.Zero ? delay : TimeSpan.Zero, _time, generation.Token);
                     if (Volatile.Read(ref _disconnecting)) await Task.Delay(Timeout.InfiniteTimeSpan, _time, generation.Token);
                     // Authenticated REGISTER refresh both checks credentials and keeps the incoming route alive.
-                    expires = await RegisterAsync(_config.RegistrationLifetimeSeconds, generation.Token);
+                    TimeSpan remaining = expires - _time.GetUtcNow();
+                    using var validity = new CancellationTokenSource(remaining > TimeSpan.Zero ? remaining : TimeSpan.Zero, _time);
+                    using var refresh = CancellationTokenSource.CreateLinkedTokenSource(generation.Token, validity.Token);
+                    try { expires = await RegisterAsync(_config.RegistrationLifetimeSeconds, refresh.Token); }
+                    catch (OperationCanceledException) when (validity.IsCancellationRequested && !generation.IsCancellationRequested)
+                    { throw new IOException("SIP registration expired before its refresh completed."); }
                     if (Volatile.Read(ref _disconnecting)) await Task.Delay(Timeout.InfiniteTimeSpan, _time, generation.Token);
                     SetStatus(SipClientState.Connected, expires: expires);
                     foreach (var pair in _responses.Where(p => p.Value.Expires <= _time.GetUtcNow()).ToArray()) _responses.TryRemove(pair.Key, out _);
+                    foreach (var pair in _retiredCalls.Where(p => p.Value.Expires <= _time.GetUtcNow()).ToArray()) _retiredCalls.TryRemove(pair.Key, out _);
+                    foreach (var pair in _inviteRequests.Where(p => p.Value.Expires <= _time.GetUtcNow()).ToArray()) _inviteRequests.TryRemove(pair.Key, out _);
                 }
                 stop.ThrowIfCancellationRequested();
                 throw new IOException("SIP receive loop stopped.");
@@ -115,7 +126,7 @@ public sealed class SipClient : IAsyncDisposable
                 await transport.DisposeAsync();
                 if (receiver is not null) try { await receiver; } catch (Exception error) when (error is OperationCanceledException or IOException or System.Net.Sockets.SocketException or ObjectDisposedException) { }
                 foreach (var call in Calls) await call.EndAsync(SipCallEndReason.ConnectionLost);
-                _transport = null; _responses.Clear();
+                _transport = null; _responses.Clear(); _retiredCalls.Clear(); _inviteRequests.Clear();
             }
             try { await Task.Delay(_config.ReconnectDelay, _time, stop); } catch (OperationCanceledException) { break; }
         }
@@ -181,8 +192,17 @@ public sealed class SipClient : IAsyncDisposable
     {
         for (int attempt = 0; attempt < 3; attempt++)
         {
+            if (request.Method == "INVITE")
+            {
+                var headers = new SipMessage { StartLine = request.StartLine };
+                foreach (string name in new[] { "Via", "From", "To", "Call-ID", "CSeq", "Max-Forwards", "Route" })
+                    foreach (string value in request.GetAll(name)) headers.Add(name, value);
+                TrimCache(_inviteRequests, 1024, x => x.Expires);
+                _inviteRequests[request.TransactionKey] = (headers, _time.GetUtcNow().AddMinutes(4));
+            }
             var response = await _transactions.SendAsync(request, Transport, progress, cancellationToken);
-            if (request.Method == "INVITE" && response.StatusCode >= 300) await SendFailureAckAsync(request, response, cancellationToken);
+            if (request.Method == "INVITE" && response.StatusCode >= 300) await SendFailureAckAsync(request, response, _stop?.Token ?? default);
+            if (cancellationToken.IsCancellationRequested || request.Method == "CANCEL") return response;
             if (response.StatusCode is not (401 or 407) || attempt == 2) return response;
             bool proxy = response.StatusCode == 407;
             await _authLock.WaitAsync(cancellationToken);
@@ -203,39 +223,72 @@ public sealed class SipClient : IAsyncDisposable
     }
     internal async Task ReplyAsync(SipMessage request, SipMessage response, CancellationToken cancellationToken = default)
     {
-        _responses[request.TransactionKey] = (response, _time.GetUtcNow().AddSeconds(64));
+        TrimCache(_responses, 1024, x => x.Expires);
+        _responses[request.TransactionKey + ":" + request.Get("Call-ID")] = (response, _time.GetUtcNow().AddSeconds(64));
         await SendAsync(response, cancellationToken);
     }
     private async Task OnMessageAsync(SipMessage message)
     {
         if (message.IsResponse)
         {
-            if (!_transactions.Receive(message) && _calls.TryGetValue(message.Get("Call-ID"), out var call))
-                await call.OnResponseAsync(message);
+            if (_transactions.Receive(message)) return;
+            if (message.CSeqMethod == "INVITE" && message.StatusCode >= 300 &&
+                _inviteRequests.TryGetValue(message.TransactionKey, out var prior) && prior.Expires > _time.GetUtcNow() &&
+                message.Get("Call-ID") == prior.Request.Get("Call-ID") && message.Get("From") == prior.Request.Get("From"))
+                await SendFailureAckAsync(prior.Request, message, _stop?.Token ?? default);
+            else if (_calls.TryGetValue(message.Get("Call-ID"), out var call)) await call.OnResponseAsync(message);
+            else if (_retiredCalls.TryGetValue(message.Get("Call-ID"), out var retired) && retired.Expires > _time.GetUtcNow())
+                await retired.Call.OnResponseAsync(message);
             return;
         }
-        if (_responses.TryGetValue(message.TransactionKey, out var cached)) { await SendAsync(cached.Response); return; }
+        if (_responses.TryGetValue(message.TransactionKey + ":" + message.Get("Call-ID"), out var cached) && cached.Expires > _time.GetUtcNow())
+        { await SendAsync(cached.Response); return; }
         if (_calls.TryGetValue(message.Get("Call-ID"), out var existing)) { await existing.OnRequestAsync(message); return; }
         if (message.Method == "OPTIONS") { await ReplyAsync(message, SipMessage.Response(message, 200, "OK")); return; }
         if (message.Method == "ACK") return;
         if (message.Method != "INVITE") { await ReplyAsync(message, SipMessage.Response(message, 481, "Call/Transaction Does Not Exist")); return; }
-        if (Status.State != SipClientState.Connected || _calls.Count >= _config.MaxConcurrentCalls)
-        { await ReplyAsync(message, SipMessage.Response(message, 486, "Busy Here")); return; }
         if (message.Get("Require").Length > 0) { await ReplyAsync(message, SipMessage.Response(message, 420, "Bad Extension")); return; }
-        var incoming = SipCall.Incoming(this, message);
-        if (!_calls.TryAdd(incoming.Id, incoming)) { await incoming.DisposeAsync(); return; }
+        SipCall? incoming = null;
+        lock (_callsGate)
+        {
+            if (Status.State == SipClientState.Connected && _calls.Count < _config.MaxConcurrentCalls)
+            { incoming = SipCall.Incoming(this, message); _calls[incoming.Id] = incoming; }
+        }
+        if (incoming is null) { await ReplyAsync(message, SipMessage.Response(message, 486, "Busy Here")); return; }
         await incoming.RingAsync();
         Publish(IncomingCall, incoming);
     }
     public SipCall CreateCall(string destination)
     {
-        ObjectDisposedException.ThrowIf(_disposed, this);
-        if (Status.State != SipClientState.Connected) throw new InvalidOperationException("Client is not Connected.");
-        if (_calls.Count >= _config.MaxConcurrentCalls) throw new InvalidOperationException("Concurrent call limit reached.");
-        string uri = destination.StartsWith("sip:", StringComparison.OrdinalIgnoreCase) ? destination : $"sip:{Uri.EscapeDataString(destination)}@{_config.SipDomain}";
-        var call = SipCall.Outgoing(this, uri); _calls[call.Id] = call; return call;
+        ArgumentException.ThrowIfNullOrWhiteSpace(destination);
+        lock (_callsGate)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            if (Status.State != SipClientState.Connected) throw new InvalidOperationException("Client is not Connected.");
+            if (_calls.Count >= _config.MaxConcurrentCalls) throw new InvalidOperationException("Concurrent call limit reached.");
+            string uri = destination.StartsWith("sip:", StringComparison.OrdinalIgnoreCase) ? destination : $"sip:{Uri.EscapeDataString(destination)}@{_config.SipDomain}";
+            var call = SipCall.Outgoing(this, uri); _calls[call.Id] = call; return call;
+        }
     }
-    internal void Forget(SipCall call) => _calls.TryRemove(call.Id, out _);
+    internal void Forget(SipCall call)
+    {
+        TrimCache(_retiredCalls, 256, x => x.Expires);
+        lock (_callsGate)
+        {
+            _retiredCalls[call.Id] = (call, _time.GetUtcNow().AddSeconds(64));
+            _calls.TryRemove(call.Id, out _);
+        }
+    }
+    private void TrimCache<T>(ConcurrentDictionary<string, T> cache, int capacity, Func<T, DateTimeOffset> expires)
+    {
+        foreach (var entry in cache.Where(e => expires(e.Value) <= _time.GetUtcNow()).ToArray()) cache.TryRemove(entry.Key, out _);
+        while (cache.Count >= capacity)
+        {
+            var entries = cache.ToArray();
+            if (entries.Length == 0) break;
+            var oldest = entries.MinBy(e => expires(e.Value)); cache.TryRemove(oldest.Key, out _);
+        }
+    }
     public async Task DisconnectAsync(CancellationToken cancellationToken = default)
     {
         await _lifecycle.WaitAsync(cancellationToken);
@@ -257,7 +310,20 @@ public sealed class SipClient : IAsyncDisposable
         finally { _lifecycle.Release(); }
     }
     private void SetStatus(SipClientState state, DateTimeOffset? expires = null, string? error = null, int? code = null)
-    { var status = new SipClientStatus(state, _time.GetUtcNow(), expires, error, code); Volatile.Write(ref _status, status); Publish(StatusChanged, status); }
+    {
+        var status = new SipClientStatus(state, _time.GetUtcNow(), expires, error, code);
+        lock (_callsGate)
+        {
+            lock (_readinessGate)
+            {
+                if (state != SipClientState.Connected && _status.State == SipClientState.Connected)
+                    _firstConnection = new(TaskCreationOptions.RunContinuationsAsynchronously);
+                Volatile.Write(ref _status, status);
+                if (state == SipClientState.Connected) _firstConnection.TrySetResult();
+            }
+        }
+        Publish(StatusChanged, status);
+    }
     internal void Report(string category, string message) => Publish(Diagnostic, new SipDiagnostic(_time.GetUtcNow(), category, message));
     internal void Publish<T>(EventHandler<T>? handlers, T value)
     {

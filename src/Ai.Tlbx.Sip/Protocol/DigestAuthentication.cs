@@ -32,6 +32,7 @@ internal sealed partial class DigestAuthentication
         bool hasQop = fields.TryGetValue("qop", out string? qop);
         if (hasQop && !qop!.Split(',').Any(s => s.Trim().Equals("auth", StringComparison.OrdinalIgnoreCase)))
             throw new NotSupportedException("The server does not offer Digest qop=auth.");
+        if (!_counts.ContainsKey(nonce) && _counts.Count >= 64) _counts.Remove(_counts.Keys.First());
         uint count = _counts.GetValueOrDefault(nonce) + 1; _counts[nonce] = count;
         string nc = count.ToString("x8");
         string result = hasQop ? Hash($"{ha1}:{nonce}:{nc}:{cnonce}:auth:{ha2}") : Hash($"{ha1}:{nonce}:{ha2}");

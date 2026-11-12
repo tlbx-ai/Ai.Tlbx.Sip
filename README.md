@@ -45,6 +45,10 @@ await client.ConnectAsync();
 
 `ConnectAsync` completes after successful registration. Cancelling its wait currently cancels the caller's wait, not the client's background connection lifecycle; use `DisconnectAsync` to stop the client. Automatic recovery is configurable. Status snapshots include registration expiry and the latest failure. Configuration is never persisted by the library, and `LoadClients` initializes identities without connecting them.
 
+Each client owns its credentials, authentication state, registration, calls, and media sockets. Removing one identity leaves the others running. Incoming and outgoing call creation share the same atomic `MaxConcurrentCalls` limit.
+
+An expired registration leaves `Connected` even if its refresh request is still waiting for a response. Calling `ConnectAsync` during recovery waits for a new successful registration; a previous connection's completed readiness task is not reused.
+
 ```csharp
 var clients = manager.LoadClients(configurations);
 await Task.WhenAll(clients.Select(c => c.ConnectAsync()));
@@ -64,6 +68,10 @@ await call.StartAsync(); // completes when answered, throws if rejected
 // ... exchange audio ...
 await call.HangupAsync();
 ```
+
+Cancelling `StartAsync` also cancels the remote call attempt. The endpoint waits for the required provisional response before sending CANCEL, acknowledges the final INVITE response, and closes an answer racing cancellation with ACK followed by BYE. Short-lived bounded transaction/dialog history handles retransmitted final responses after local teardown without creating duplicate BYE transactions.
+
+`TransactionTimeout` defaults to 32 seconds for initial transaction response handling. Once an INVITE receives its first provisional response, `CallAnswerTimeout` applies instead (default: two minutes). Ringing is therefore not cut off by the initial transaction timeout.
 
 Incoming calls are delivered as call objects. Answering is always an application decision:
 
@@ -162,7 +170,7 @@ dotnet pack src/Ai.Tlbx.Sip -c Release -o artifacts
 dotnet pack src/Ai.Tlbx.VoiceAssistant.Sip -c Release -o artifacts
 ```
 
-The test runner requires no test framework and returns a nonzero exit code on failure. It covers framing, parser rejection, G.711 values, resampling continuity and anti-aliasing, RFC 3711 key-derivation vectors, SRTP tamper/replay rejection and rollover, registration/authentication, UDP retransmission, TCP stream fragmentation, contact selection, refresh/disconnect ordering, call setup/teardown, duplicate INVITEs, early-media backlog, silence suppression, PCM flow, G.722, and the VoiceAssistant adapter. Builds and tests have been run on Windows and Debian Linux. A Windows/Linux CI template is provided in `.github/verify-workflow.template.yml`; enabling it requires moving it into `.github/workflows/verify.yml` with a GitHub credential authorized to write workflows. No PBX credentials or paid AI calls are needed.
+The test runner requires no test framework and returns a nonzero exit code on failure. It covers framing, parser rejection, G.711 values, resampling continuity and anti-aliasing, RFC 3711 key-derivation vectors, SRTP tamper/replay rejection and rollover, registration/authentication, UDP retransmission, TCP stream fragmentation, contact selection, registration expiry/recovery, refresh/disconnect ordering, call setup/teardown, cancellation/acceptance races, late final responses, duplicate INVITEs, early-media backlog, silence suppression, PCM flow, G.722, and the VoiceAssistant adapter. TLS tests exchange SIP over real encrypted loopback connections and verify rejection of unknown certificate authorities and wrong hostnames, using an ephemeral test CA without changing machine trust stores. Builds and tests have been run on Windows and Debian Linux. A Windows/Linux CI template is provided in `.github/verify-workflow.template.yml`; enabling it requires moving it into `.github/workflows/verify.yml` with a GitHub credential authorized to write workflows. No PBX credentials or paid AI calls are needed.
 
 Implemented from protocol specifications: [SIP](https://www.rfc-editor.org/rfc/rfc3261), [transaction corrections](https://www.rfc-editor.org/rfc/rfc6026), [SDP offer/answer](https://www.rfc-editor.org/rfc/rfc3264), [RTP](https://www.rfc-editor.org/rfc/rfc3550), [SRTP](https://www.rfc-editor.org/rfc/rfc3711), and [SDES](https://www.rfc-editor.org/rfc/rfc4568).
 
