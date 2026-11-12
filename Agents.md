@@ -1,6 +1,6 @@
 # Ai.Tlbx.Sip
 
-Build with .NET 11 / C# 15. Keep `Ai.Tlbx.Sip` independent of AI providers and audio-device APIs; the VoiceAssistant adapter is a separate project.
+Build with the .NET 11 SDK / C# 15. Both libraries, protocol tests and console target net10.0 and net11.0; run verification on both targets. Keep `Ai.Tlbx.Sip` independent of AI providers and audio-device APIs; the VoiceAssistant adapter is a separate project.
 
 Implement protocol behavior from the RFCs. Preserve native SIP status codes alongside application-level states. `Connected` means authenticated registration and incoming-call readiness, maintained by monitoring and renewal.
 

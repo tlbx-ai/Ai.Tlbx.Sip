@@ -17,7 +17,9 @@ try {
     $feed = Join-Path $output $version
     New-Item -ItemType Directory -Force $feed | Out-Null
     Invoke-Dotnet @('build', 'Ai.Tlbx.Sip.slnx', '-c', 'Release')
-    Invoke-Dotnet @('run', '--project', 'tests/Ai.Tlbx.Sip.Tests', '-c', 'Release', '--no-build')
+    foreach ($framework in @('net10.0', 'net11.0')) {
+        Invoke-Dotnet @('run', '--project', 'tests/Ai.Tlbx.Sip.Tests', '-c', 'Release', '-f', $framework, '--no-build')
+    }
     foreach ($id in @('Ai.Tlbx.Sip', 'Ai.Tlbx.VoiceAssistant.Sip')) {
         Invoke-Dotnet @('pack', "src/$id", '-c', 'Release', '--no-build', '-o', $feed)
         $archive = [IO.Compression.ZipFile]::OpenRead((Join-Path $feed "$id.$version.nupkg"))
@@ -28,11 +30,15 @@ try {
             try { [xml]$manifest = $reader.ReadToEnd() } finally { $reader.Dispose() }
             if ($manifest.package.metadata.id -ne $id -or $manifest.package.metadata.version -ne $version -or
                 $manifest.package.metadata.license.InnerText -ne 'MIT') { throw 'Package identity/version/license mismatch.' }
-            if (-not $archive.GetEntry('README.md') -or -not $archive.GetEntry("lib/net11.0/$id.dll")) { throw 'Missing package assembly/readme.' }
-            if ($id -eq 'Ai.Tlbx.VoiceAssistant.Sip') {
-                $dependency = @($manifest.package.metadata.dependencies.group.dependency | Where-Object id -eq 'Ai.Tlbx.Sip')
-                if ($dependency.Count -ne 1 -or $dependency[0].version.Trim([char[]]'[]() ') -ne $version) {
-                    throw 'Adapter must reference this exact minimum SIP version.'
+            if (-not $archive.GetEntry('README.md')) { throw 'Missing package readme.' }
+            foreach ($framework in @('net10.0', 'net11.0')) {
+                if (-not $archive.GetEntry("lib/$framework/$id.dll")) { throw "Missing $framework assembly." }
+                if ($id -eq 'Ai.Tlbx.VoiceAssistant.Sip') {
+                    $group = @($manifest.package.metadata.dependencies.group | Where-Object targetFramework -eq $framework)
+                    $dependency = @($group.dependency | Where-Object id -eq 'Ai.Tlbx.Sip')
+                    if ($dependency.Count -ne 1 -or $dependency[0].version.Trim([char[]]'[]() ') -ne $version) {
+                        throw 'Adapter must reference this exact minimum SIP version on each target.'
+                    }
                 }
             }
         } finally { $archive.Dispose() }
@@ -44,7 +50,7 @@ try {
     $project = Join-Path $consumer 'Consumer.csproj'
     @"
 <Project Sdk="Microsoft.NET.Sdk">
-  <PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net11.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings><Nullable>enable</Nullable><TreatWarningsAsErrors>true</TreatWarningsAsErrors></PropertyGroup>
+  <PropertyGroup><OutputType>Exe</OutputType><TargetFrameworks>net10.0;net11.0</TargetFrameworks><ImplicitUsings>enable</ImplicitUsings><Nullable>enable</Nullable><TreatWarningsAsErrors>true</TreatWarningsAsErrors></PropertyGroup>
   <ItemGroup><PackageReference Include="Ai.Tlbx.VoiceAssistant.Sip" Version="[$version]" /></ItemGroup>
 </Project>
 "@ | Set-Content $project
@@ -68,7 +74,9 @@ Console.WriteLine("PASS isolated package consumer (no project references or netw
 <configuration><packageSources><clear/><add key="release" value="$escapedFeed"/><add key="nuget.org" value="https://api.nuget.org/v3/index.json"/></packageSources></configuration>
 "@ | Set-Content $sources
     Invoke-Dotnet @('restore', $project, '--configfile', $sources, '--packages', $cache)
-    Invoke-Dotnet @('run', '--project', $project, '-c', 'Release', '--no-restore')
+    foreach ($framework in @('net10.0', 'net11.0')) {
+        Invoke-Dotnet @('run', '--project', $project, '-c', 'Release', '-f', $framework, '--no-restore')
+    }
     $records = @(Get-ChildItem $feed -Filter '*.nupkg' | ForEach-Object {
         [ordered]@{ file = $_.Name; sha256 = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant(); bytes = $_.Length }
     })

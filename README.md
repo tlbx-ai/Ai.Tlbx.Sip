@@ -16,7 +16,7 @@ Encrypted RTP/RTCP is verified with local peers and independent numeric referenc
 | `Ai.Tlbx.VoiceAssistant.Sip` | A per-call `IAudioHardwareAccess` adapter for [Ai.Tlbx.VoiceAssistant](https://github.com/tlbx-ai/Ai.Tlbx.VoiceAssistant). |
 | `SipConsole` | Explicitly controlled registration, incoming/outgoing calls, and optional audio echo. |
 
-Uses .NET 11 and C# 15. The SIP core references the cross-platform MIT-licensed `NAudio.Core` package for its managed G.722 codec. The VoiceAssistant adapter references the published VoiceAssistant package. No native SIP/media binary, FFmpeg, ALSA, or Windows audio API is required by these libraries.
+Both packages target .NET 10 and .NET 11 (`net10.0;net11.0`). Build from source with the .NET 11 SDK and C# 15; consumers can run on either supported runtime. The SIP core references the cross-platform MIT-licensed `NAudio.Core` package for its managed G.722 codec. The VoiceAssistant adapter references the published VoiceAssistant package. No native SIP/media binary, FFmpeg, ALSA, or Windows audio API is required by these libraries.
 
 ## Install
 
@@ -168,7 +168,7 @@ $env:SIP_REGISTRAR = 'fritz.box'
 $env:SIP_USER = 'my-sip-user'
 $env:SIP_AUTH_USER = 'my-auth-user' # optional if equal to SIP_USER
 # Supply SIP_PASSWORD through your environment/secret manager.
-dotnet run --project samples/SipConsole
+dotnet run --project samples/SipConsole -f net10.0
 ```
 
 Commands: `list`, `call <number>`, `answer <call-id>`, `hangup <call-id>`, `quit`.
@@ -185,14 +185,15 @@ easybell Cloud PBX is an intended interoperability target, using its endpoint cr
 
 ```sh
 dotnet build Ai.Tlbx.Sip.slnx -c Release
-dotnet run --project tests/Ai.Tlbx.Sip.Tests -c Release
+dotnet run --project tests/Ai.Tlbx.Sip.Tests -c Release -f net10.0
+dotnet run --project tests/Ai.Tlbx.Sip.Tests -c Release -f net11.0
 dotnet pack src/Ai.Tlbx.Sip -c Release -o artifacts
 dotnet pack src/Ai.Tlbx.VoiceAssistant.Sip -c Release -o artifacts
 ```
 
 The test runner requires no test framework and returns a nonzero exit code on failure. It covers framing, parser rejection, G.711 values, resampling continuity and anti-aliasing, RFC 3711 key-derivation vectors, SRTP tamper/replay rejection and rollover, registration/authentication, UDP retransmission, TCP stream fragmentation, contact selection, registration expiry/recovery, refresh/disconnect ordering, call setup/teardown, cancellation/acceptance races, late final responses, duplicate INVITEs, invalid destinations, progress-only timeouts and their final ACKs, early-media backlog, silence suppression, PCM flow, G.722, minimum-size transmit buffers and the VoiceAssistant adapter. TLS tests exchange SIP over real encrypted loopback connections and verify rejection of unknown certificate authorities and wrong hostnames, using an ephemeral test CA without changing machine trust stores. Builds and tests run on Windows and Debian Linux without PBX credentials or paid AI calls. The VoiceAssistant demo's additional local-peer tests verify complete ordered RTP sections for an AI burst longer than the SIP transmit buffer.
 
-Run `pwsh ./verify-release.ps1` for the release gate: build, protocol/media checks, both packages, identity/license/dependency checks, and a fresh-cache consumer outside the repository without project references. Packages and SHA-256 verification metadata are written under `artifacts/release/<version>/`. GitHub `verify.yml` runs this gate on Windows and Linux.
+Run `pwsh ./verify-release.ps1` for the release gate: build, protocol/media checks on both target frameworks, both packages including both assemblies/dependency groups, identity/license checks, and a fresh-cache consumer for each target outside the repository without project references. Packages and SHA-256 verification metadata are written under `artifacts/release/<version>/`. GitHub `verify.yml` runs this gate on Windows and Linux.
 
 ## Publishing
 
