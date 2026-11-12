@@ -1,0 +1,233 @@
+using System.Text;
+using Ai.Tlbx.Sip.Protocol;
+
+namespace Ai.Tlbx.Sip;
+
+public sealed class SipCall : IAsyncDisposable
+{
+    private readonly SipClient _client;
+    private readonly object _gate = new();
+    private readonly string _localTag = SipClient.NewId();
+    private readonly CancellationTokenSource _stop = new();
+    private readonly TaskCompletionSource _ack = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly TaskCompletionSource<SipCallStatus> _completion = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private SipCallStatus _status;
+    private SipMessage? _invite, _answer;
+    private string _localHeader = "", _remoteHeader, _remoteTarget;
+    private string[] _routes = [];
+    private int _remoteSequence = -1;
+    private Task? _dialTask;
+    private bool _ending;
+    private SipCall(SipClient client, string id, SipCallDirection direction, string remote)
+    {
+        _client = client; Id = id; Direction = direction; _remoteTarget = remote; _remoteHeader = "<" + remote + ">";
+        _status = new(direction == SipCallDirection.Incoming ? SipCallState.Incoming : SipCallState.Created, client.Time.GetUtcNow());
+        Audio = new(client.Config, client.Time, client.MediaAddress, error => client.Report("media", error));
+    }
+    public string Id { get; }
+    public SipCallDirection Direction { get; }
+    public string RemoteUri => SipMessage.UriFromHeader(_remoteHeader);
+    public SipCallStatus Status => Volatile.Read(ref _status);
+    public SipCallAudio Audio { get; }
+    public SipMediaMetrics Metrics => Audio.Metrics;
+    public Task<SipCallStatus> Completion => _completion.Task;
+    public event EventHandler<SipCallStatus>? StatusChanged;
+    public event EventHandler<SipCallStatus>? Ended;
+    internal static SipCall Outgoing(SipClient client, string uri) => new(client, SipClient.NewId(), SipCallDirection.Outgoing, uri);
+    internal static SipCall Incoming(SipClient client, SipMessage invite)
+    {
+        var call = new SipCall(client, invite.Get("Call-ID"), SipCallDirection.Incoming, SipMessage.UriFromHeader(invite.Get("Contact")));
+        call._invite = invite; call._remoteHeader = invite.Get("From");
+        call._localHeader = invite.Get("To") + ";tag=" + call._localTag;
+        call._routes = invite.GetAll("Record-Route").ToArray(); call._remoteSequence = invite.CSeqNumber;
+        return call;
+    }
+    internal async Task RingAsync()
+    {
+        await _client.ReplyAsync(_invite!, SipMessage.Response(_invite!, 100, "Trying"));
+        await _client.ReplyAsync(_invite!, SipMessage.Response(_invite!, 180, "Ringing", _localTag));
+    }
+    public Task StartAsync(CancellationToken cancellationToken = default)
+    {
+        lock (_gate)
+        {
+            if (Direction != SipCallDirection.Outgoing || Status.State != SipCallState.Created) throw new InvalidOperationException("Only a new outgoing call can be started.");
+            SetStatus(SipCallState.Calling);
+            return _dialTask = DialAsync(cancellationToken);
+        }
+    }
+    private async Task DialAsync(CancellationToken cancellationToken)
+    {
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _stop.Token);
+        try
+        {
+            _invite = _client.Request("INVITE", _remoteTarget, Id, _localTag, _remoteHeader);
+            _localHeader = _invite.Get("From");
+            _invite.Add("Content-Type", "application/sdp");
+            _invite.Body = Encoding.UTF8.GetBytes(SdpSession.Offer(_client.MediaAddress, Audio.Port, Audio.MasterKey, _client.Time.GetUtcNow().ToUnixTimeMilliseconds()));
+            var response = await _client.RequestAuthenticatedAsync(_invite, p =>
+            {
+                if (p.StatusCode is 180 or 183 && Status.State == SipCallState.Calling) SetStatus(SipCallState.Ringing, p.StatusCode);
+            }, linked.Token);
+            if (response.StatusCode >= 300)
+            {
+                await EndAsync(response.StatusCode is 486 or 600 ? SipCallEndReason.Busy : response.StatusCode == 487 ? SipCallEndReason.Cancelled : SipCallEndReason.Rejected, response.StatusCode);
+                throw new SipException(response.StatusCode, $"Call rejected with SIP {response.StatusCode}.");
+            }
+            _remoteHeader = response.Get("To");
+            _remoteTarget = SipMessage.UriFromHeader(response.Get("Contact"));
+            _routes = response.GetAll("Record-Route").Reverse().ToArray();
+            await AckAsync(response);
+            if (Status.State == SipCallState.Ended) return;
+            var session = SdpSession.Parse(response.Body, _client.Config.MediaSecurity);
+            Audio.Start(session);
+            if (_ending) { await SendByeAsync(linked.Token); await EndAsync(SipCallEndReason.LocalHangup); }
+            else SetStatus(SipCallState.Established, response.StatusCode);
+        }
+        catch (OperationCanceledException)
+        {
+            if (Status.State != SipCallState.Ended) await EndAsync(SipCallEndReason.Cancelled);
+            throw;
+        }
+        catch (Exception error)
+        {
+            if (Status.State != SipCallState.Ended) await EndAsync(error is TimeoutException ? SipCallEndReason.Timeout : SipCallEndReason.ProtocolError, error: error.Message);
+            throw;
+        }
+    }
+    public async Task AnswerAsync(CancellationToken cancellationToken = default)
+    {
+        lock (_gate)
+        {
+            if (Direction != SipCallDirection.Incoming || Status.State != SipCallState.Incoming) throw new InvalidOperationException("Call is not awaiting an answer.");
+            SetStatus(SipCallState.Answering);
+        }
+        try
+        {
+            var remote = SdpSession.Parse(_invite!.Body, _client.Config.MediaSecurity);
+            _answer = SipMessage.Response(_invite, 200, "OK", _localTag);
+            _answer.Add("Contact", _client.Contact); _answer.Add("Content-Type", "application/sdp");
+            _answer.Body = Encoding.UTF8.GetBytes(SdpSession.Answer(_client.MediaAddress, Audio.Port, Audio.MasterKey,
+                _client.Time.GetUtcNow().ToUnixTimeMilliseconds(), remote));
+            using var deadline = new CancellationTokenSource(_client.Config.TransactionTimeout, _client.Time);
+            using var linked = CancellationTokenSource.CreateLinkedTokenSource(deadline.Token, cancellationToken, _stop.Token);
+            TimeSpan interval = _client.Config.InitialRetransmitInterval;
+            await _client.ReplyAsync(_invite, _answer, linked.Token);
+            while (!_ack.Task.IsCompleted)
+            {
+                using var tick = CancellationTokenSource.CreateLinkedTokenSource(linked.Token);
+                var delay = Task.Delay(interval, _client.Time, tick.Token);
+                var done = await Task.WhenAny(_ack.Task, delay);
+                if (done == _ack.Task) { tick.Cancel(); break; }
+                await delay;
+                await _client.SendAsync(_answer, linked.Token);
+                interval = TimeSpan.FromMilliseconds(Math.Min(interval.TotalMilliseconds * 2, 4000));
+            }
+            if (_stop.IsCancellationRequested) return;
+            Audio.Start(remote); SetStatus(SipCallState.Established, 200);
+        }
+        catch (Exception error)
+        {
+            if (_answer is null && Status.State != SipCallState.Ended)
+                await _client.ReplyAsync(_invite!, SipMessage.Response(_invite!, 488, "Not Acceptable Here", _localTag));
+            await EndAsync(error is OperationCanceledException ? SipCallEndReason.Timeout : SipCallEndReason.ProtocolError, error: error.Message);
+            throw;
+        }
+    }
+    public async Task RejectAsync(int statusCode = 486, CancellationToken cancellationToken = default)
+    {
+        lock (_gate)
+        {
+            if (Direction != SipCallDirection.Incoming || Status.State != SipCallState.Incoming) throw new InvalidOperationException("Call cannot be rejected in its current state.");
+            if (statusCode is < 400 or > 699) throw new ArgumentOutOfRangeException(nameof(statusCode));
+            SetStatus(SipCallState.Ending);
+        }
+        await _client.ReplyAsync(_invite!, SipMessage.Response(_invite!, statusCode, statusCode == 486 ? "Busy Here" : "Decline", _localTag), cancellationToken);
+        await EndAsync(SipCallEndReason.Rejected, statusCode);
+    }
+    public async Task HangupAsync(CancellationToken cancellationToken = default)
+    {
+        SipCallState state;
+        lock (_gate) { state = Status.State; if (state == SipCallState.Ended || _ending) return; _ending = true; }
+        if (state == SipCallState.Created) { await EndAsync(SipCallEndReason.Cancelled); return; }
+        if (state == SipCallState.Incoming) { await RejectAsync(603, cancellationToken); return; }
+        if (state is SipCallState.Calling or SipCallState.Ringing)
+        {
+            if (_invite is null) return;
+            var cancel = new SipMessage { StartLine = $"CANCEL {_invite.RequestUri} SIP/2.0" };
+            foreach (string name in new[] { "Via", "From", "To", "Call-ID", "Route", "Max-Forwards" })
+                foreach (string value in _invite.GetAll(name)) cancel.Add(name, value);
+            cancel.Add("CSeq", _invite.CSeqNumber + " CANCEL");
+            await _client.RequestAuthenticatedAsync(cancel, null, cancellationToken);
+            if (_dialTask is not null) try { await _dialTask; } catch (SipException) { }
+            return;
+        }
+        if (state == SipCallState.Answering) { await _ack.Task.WaitAsync(cancellationToken); }
+        SetStatus(SipCallState.Ending);
+        try { await SendByeAsync(cancellationToken); }
+        finally { await EndAsync(SipCallEndReason.LocalHangup); }
+    }
+    private async Task SendByeAsync(CancellationToken cancellationToken)
+    { var response = await _client.RequestAuthenticatedAsync(DialogRequest("BYE"), null, cancellationToken); SipClient.EnsureSuccess(response); }
+    private SipMessage DialogRequest(string method, int? sequence = null)
+    {
+        var request = _client.Request(method, _remoteTarget, Id, _localTag, _remoteHeader, sequence);
+        request.Set("From", _localHeader);
+        foreach (string route in _routes) request.Add("Route", route);
+        return request;
+    }
+    private Task AckAsync(SipMessage response)
+    {
+        var ack = DialogRequest("ACK", response.CSeqNumber);
+        return _client.SendAsync(ack);
+    }
+    internal async Task OnResponseAsync(SipMessage response)
+    {
+        if (response.CSeqMethod == "INVITE" && response.StatusCode is >= 200 and < 300 && _invite is not null)
+            await AckAsync(response);
+    }
+    internal async Task OnRequestAsync(SipMessage request)
+    {
+        bool matches = SipMessage.Parameter(request.Get("To"), "tag") == _localTag &&
+            SipMessage.Parameter(request.Get("From"), "tag") == SipMessage.Parameter(_remoteHeader, "tag");
+        if (request.Method == "CANCEL" && _invite is not null && request.CSeqNumber == _invite.CSeqNumber &&
+            SipMessage.Parameter(request.Get("Via"), "branch") == SipMessage.Parameter(_invite.Get("Via"), "branch"))
+        {
+            await _client.ReplyAsync(request, SipMessage.Response(request, 200, "OK"));
+            if (Status.State == SipCallState.Incoming)
+            {
+                await _client.ReplyAsync(_invite, SipMessage.Response(_invite, 487, "Request Terminated", _localTag));
+                await EndAsync(SipCallEndReason.Cancelled, 487);
+            }
+            return;
+        }
+        if (!matches)
+        { if (request.Method != "ACK") await _client.ReplyAsync(request, SipMessage.Response(request, 481, "Call/Transaction Does Not Exist")); return; }
+        if (request.Method == "ACK") { if (_invite?.CSeqNumber == request.CSeqNumber) _ack.TrySetResult(); return; }
+        if (request.CSeqNumber <= _remoteSequence)
+        { await _client.ReplyAsync(request, SipMessage.Response(request, 500, "CSeq Out of Order")); return; }
+        _remoteSequence = request.CSeqNumber;
+        if (request.Method == "BYE")
+        { await _client.ReplyAsync(request, SipMessage.Response(request, 200, "OK")); await EndAsync(SipCallEndReason.RemoteHangup); }
+        else if (request.Method == "OPTIONS") await _client.ReplyAsync(request, SipMessage.Response(request, 200, "OK"));
+        else await _client.ReplyAsync(request, SipMessage.Response(request, request.Method == "INVITE" ? 488 : 405, "Not Supported", _localTag));
+    }
+    internal async Task EndAsync(SipCallEndReason reason, int? code = null, string? error = null)
+    {
+        lock (_gate)
+        {
+            if (Status.State == SipCallState.Ended) return;
+            _stop.Cancel(); SetStatus(SipCallState.Ended, code, reason, error); _client.Forget(this);
+        }
+        await Audio.DisposeAsync(); _completion.TrySetResult(Status); Publish(Ended, Status);
+    }
+    private void SetStatus(SipCallState state, int? code = null, SipCallEndReason? reason = null, string? error = null)
+    {
+        var status = new SipCallStatus(state, _client.Time.GetUtcNow(), reason, code, error);
+        Volatile.Write(ref _status, status); Publish(StatusChanged, status);
+    }
+    private void Publish(EventHandler<SipCallStatus>? handlers, SipCallStatus status)
+    { foreach (EventHandler<SipCallStatus> h in handlers?.GetInvocationList() ?? []) try { h(this, status); } catch { } }
+    public async ValueTask DisposeAsync()
+    { if (Status.State != SipCallState.Ended) await HangupAsync(); await Audio.DisposeAsync(); }
+}

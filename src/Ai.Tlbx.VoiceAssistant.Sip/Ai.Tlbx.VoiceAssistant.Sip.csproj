@@ -1,0 +1,9 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <Description>Per-call SIP PCM audio adapter for Ai.Tlbx.VoiceAssistant.</Description>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../Ai.Tlbx.Sip/Ai.Tlbx.Sip.csproj" />
+    <PackageReference Include="Ai.Tlbx.VoiceAssistant" Version="11.9.0" />
+  </ItemGroup>
+</Project>

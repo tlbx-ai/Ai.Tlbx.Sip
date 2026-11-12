@@ -1,0 +1,7 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><OutputType>Exe</OutputType><IsPackable>false</IsPackable></PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../src/Ai.Tlbx.Sip/Ai.Tlbx.Sip.csproj" />
+    <ProjectReference Include="../../src/Ai.Tlbx.VoiceAssistant.Sip/Ai.Tlbx.VoiceAssistant.Sip.csproj" />
+  </ItemGroup>
+</Project>

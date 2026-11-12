@@ -1,0 +1,227 @@
+using System.Buffers.Binary;
+using System.Net;
+using System.Net.Sockets;
+using System.Security.Cryptography;
+using System.Threading.Channels;
+using Ai.Tlbx.Sip.Media;
+using Ai.Tlbx.Sip.Protocol;
+
+namespace Ai.Tlbx.Sip;
+
+/// <summary>Owned immutable PCM16 mono samples. The receiver may retain a frame after reading it.</summary>
+public sealed record PcmAudioFrame(ReadOnlyMemory<short> Samples, int SampleRate, long SamplePosition);
+
+/// <summary>A single call's bounded PCM media stream. No audio device or AI dependency.</summary>
+public sealed class SipCallAudio : IAsyncDisposable
+{
+    private readonly SipClientConfig _config;
+    private readonly TimeProvider _time;
+    private readonly Action<string> _failure;
+    private readonly object _gate = new();
+    private readonly UdpClient _rtp;
+    private readonly Channel<PcmAudioFrame> _received = Channel.CreateBounded<PcmAudioFrame>(new BoundedChannelOptions(100)
+    { SingleReader = false, SingleWriter = true, FullMode = BoundedChannelFullMode.DropOldest });
+    private readonly Queue<short> _outbound = new();
+    private readonly SortedDictionary<long, (uint Timestamp, byte[] Payload)> _jitter = [];
+    private readonly CancellationTokenSource _stop = new();
+    private readonly PcmResampler _rxResampler;
+    private PcmResampler? _txResampler;
+    private int _txInputRate;
+    private IPEndPoint? _remote;
+    private SdpSession? _session;
+    private SrtpContext? _txCrypto, _rxCrypto;
+    private readonly byte[]? _masterKey;
+    private Task[] _tasks = [];
+    private long _txPackets, _rxPackets, _txBytes, _rxBytes, _lost, _duplicate, _late, _underruns;
+    private long _highestSequence = -1, _playSequence = -1, _samplePosition;
+    private long _lastTransit;
+    private bool _transitKnown, _playing, _disposed, _started;
+    private double _jitterSamples;
+    private readonly uint _ssrc = (uint)RandomNumberGenerator.GetInt32(1, int.MaxValue);
+    private uint? _remoteSsrc;
+    private ushort _sequence = (ushort)RandomNumberGenerator.GetInt32(ushort.MaxValue);
+    private uint _timestamp = (uint)RandomNumberGenerator.GetInt32(int.MaxValue);
+    internal SipCallAudio(SipClientConfig config, TimeProvider time, IPAddress localAddress, Action<string> failure)
+    {
+        _config = config; _time = time; _failure = failure;
+        _rtp = new UdpClient(new IPEndPoint(localAddress, 0));
+        _rxResampler = new(8000, config.AudioSampleRate);
+        _masterKey = config.MediaSecurity == SipMediaSecurity.SdesRequired ? SdpSession.NewMasterKey() : null;
+    }
+    internal int Port => ((IPEndPoint)_rtp.Client.LocalEndPoint!).Port;
+    internal byte[]? MasterKey => _masterKey;
+    public int SampleRate => _config.AudioSampleRate;
+    public TimeSpan QueuedAudio { get { lock (_gate) return TimeSpan.FromSeconds(_outbound.Count / 8000.0); } }
+    public SipMediaMetrics Metrics
+    {
+        get { lock (_gate) return new(_txPackets, _rxPackets, _txBytes, _rxBytes, _lost, _duplicate, _late,
+            _jitterSamples / 8.0, null, TimeSpan.FromSeconds(_outbound.Count / 8000.0), _underruns, _session?.Codec); }
+    }
+    public event EventHandler<SipMediaMetrics>? MetricsChanged;
+    public IAsyncEnumerable<PcmAudioFrame> ReadFramesAsync(CancellationToken cancellationToken = default) => _received.Reader.ReadAllAsync(cancellationToken);
+    /// <summary>Copies samples. Returns false without consuming input when the bounded transmit queue is full.</summary>
+    public bool TryWrite(ReadOnlySpan<short> samples, int sampleRate)
+    {
+        if (sampleRate is < 8000 or > 96000) throw new ArgumentOutOfRangeException(nameof(sampleRate));
+        lock (_gate)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            if (_stop.IsCancellationRequested) return false;
+            int estimate = (int)Math.Ceiling(samples.Length * 8000.0 / sampleRate) + 64;
+            if (_outbound.Count + estimate > _config.MaxQueuedAudio.TotalSeconds * 8000) return false;
+            if (_txResampler is null || _txInputRate != sampleRate)
+            {
+                if (_txResampler is not null)
+                    foreach (short s in _txResampler.Process([], endOfStream: true)) _outbound.Enqueue(s);
+                _txResampler = new(sampleRate, 8000); _txInputRate = sampleRate;
+            }
+            foreach (short s in _txResampler.Process(samples)) _outbound.Enqueue(s);
+            return true;
+        }
+    }
+    public void FlushInput()
+    {
+        lock (_gate)
+        {
+            if (_txResampler is null) return;
+            foreach (short s in _txResampler.Process([], endOfStream: true)) _outbound.Enqueue(s);
+            _txResampler = null;
+        }
+    }
+    public void ClearOutput()
+    { lock (_gate) { _outbound.Clear(); _txResampler?.Reset(); } }
+    public async Task<bool> WaitForDrainAsync(TimeSpan timeout, CancellationToken cancellationToken = default)
+    {
+        FlushInput();
+        var start = _time.GetTimestamp();
+        while (QueuedAudio > TimeSpan.Zero)
+        {
+            if (_stop.IsCancellationRequested || _time.GetElapsedTime(start) >= timeout) return false;
+            await Task.Delay(TimeSpan.FromMilliseconds(20), _time, cancellationToken);
+        }
+        return true;
+    }
+    internal void Start(SdpSession session)
+    {
+        lock (_gate)
+        {
+            if (_started) throw new InvalidOperationException("Call media already started.");
+            _started = true; _session = session; _remote = new(session.Address, session.Port);
+            if (session.Secure) { _txCrypto = new(_masterKey!); _rxCrypto = new(session.MasterKey!); }
+            _tasks = [GuardAsync(ReceiveAsync), GuardAsync(SendAsync), GuardAsync(PlayoutAsync), GuardAsync(MetricsAsync)];
+        }
+    }
+    private async Task GuardAsync(Func<CancellationToken, Task> action)
+    {
+        try { await action(_stop.Token); }
+        catch (OperationCanceledException) when (_stop.IsCancellationRequested) { }
+        catch (ObjectDisposedException) when (_stop.IsCancellationRequested) { }
+        catch (Exception error) { _failure(error.Message); _stop.Cancel(); _received.Writer.TryComplete(error); }
+    }
+    private async Task SendAsync(CancellationToken cancellationToken)
+    {
+        using var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(20), _time);
+        while (await timer.WaitForNextTickAsync(cancellationToken))
+        {
+            byte[] packet = new byte[172];
+            packet[0] = 0x80; packet[1] = (byte)_session!.PayloadType;
+            BinaryPrimitives.WriteUInt16BigEndian(packet.AsSpan(2), _sequence++);
+            BinaryPrimitives.WriteUInt32BigEndian(packet.AsSpan(4), _timestamp); _timestamp += 160;
+            BinaryPrimitives.WriteUInt32BigEndian(packet.AsSpan(8), _ssrc);
+            lock (_gate)
+            {
+                if (_outbound.Count < 160) _underruns++;
+                for (int i = 12; i < packet.Length; i++) packet[i] = G711.Encode(_outbound.Count > 0 ? _outbound.Dequeue() : (short)0, _session.Codec == "PCMA");
+                if (_txCrypto is not null) packet = _txCrypto.Protect(packet, 12);
+            }
+            await _rtp.SendAsync(packet, _remote!, cancellationToken);
+            lock (_gate) { _txPackets++; _txBytes += packet.Length; }
+        }
+    }
+    internal static int RtpHeaderLength(ReadOnlySpan<byte> packet)
+    {
+        if (packet.Length < 12 || (packet[0] >> 6) != 2) return -1;
+        int length = 12 + (packet[0] & 15) * 4;
+        if (packet.Length < length) return -1;
+        if ((packet[0] & 16) != 0)
+        {
+            if (packet.Length < length + 4) return -1;
+            length += 4 + BinaryPrimitives.ReadUInt16BigEndian(packet[(length + 2)..]) * 4;
+        }
+        return length <= packet.Length ? length : -1;
+    }
+    private async Task ReceiveAsync(CancellationToken cancellationToken)
+    {
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            var datagram = await _rtp.ReceiveAsync(cancellationToken);
+            byte[] packet = datagram.Buffer;
+            if (packet.Length > 4096 || !datagram.RemoteEndPoint.Address.Equals(_remote!.Address)) continue;
+            if (!_config.AllowSymmetricRtp && datagram.RemoteEndPoint.Port != _remote.Port) continue;
+            int header = RtpHeaderLength(packet);
+            if (header < 0 || (packet[1] & 127) != _session!.PayloadType) continue;
+            lock (_gate)
+            {
+                if (_rxCrypto is not null)
+                {
+                    var plaintext = _rxCrypto.Unprotect(packet, header); if (plaintext is null) continue;
+                    packet = plaintext;
+                }
+                uint ssrc = BinaryPrimitives.ReadUInt32BigEndian(packet.AsSpan(8));
+                if (_remoteSsrc.HasValue && _remoteSsrc != ssrc) continue;
+                _remoteSsrc = ssrc;
+                if (_config.AllowSymmetricRtp) _remote = datagram.RemoteEndPoint;
+                int end = packet.Length;
+                if ((packet[0] & 32) != 0)
+                { int padding = packet[^1]; if (padding == 0 || padding > end - header) continue; end -= padding; }
+                if (end <= header || end - header > 1600) continue;
+                ushort seq = BinaryPrimitives.ReadUInt16BigEndian(packet.AsSpan(2));
+                long extended = _highestSequence < 0 ? seq : (_highestSequence & ~65535L) + seq;
+                if (_highestSequence >= 0 && extended - _highestSequence > 32768) extended -= 65536;
+                else if (_highestSequence >= 0 && _highestSequence - extended > 32768) extended += 65536;
+                if (_playing && extended < _playSequence) { _late++; continue; }
+                if (_jitter.ContainsKey(extended)) { _duplicate++; continue; }
+                if (_jitter.Count >= 100) { _late++; continue; }
+                uint timestamp = BinaryPrimitives.ReadUInt32BigEndian(packet.AsSpan(4));
+                long arrival = (long)(_time.GetTimestamp() * (8000.0 / _time.TimestampFrequency));
+                long transit = arrival - timestamp;
+                if (_transitKnown) _jitterSamples += (Math.Abs(transit - _lastTransit) - _jitterSamples) / 16.0;
+                _lastTransit = transit; _transitKnown = true;
+                _jitter[extended] = (timestamp, packet.AsSpan(header, end - header).ToArray());
+                _highestSequence = Math.Max(_highestSequence, extended); _rxPackets++; _rxBytes += datagram.Buffer.Length;
+            }
+        }
+    }
+    private async Task PlayoutAsync(CancellationToken cancellationToken)
+    {
+        using var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(20), _time);
+        while (await timer.WaitForNextTickAsync(cancellationToken))
+        {
+            short[] samples;
+            lock (_gate)
+            {
+                if (!_playing) { if (_jitter.Count < 3) continue; _playing = true; _playSequence = _jitter.First().Key; }
+                if (_jitter.Remove(_playSequence++, out var frame)) samples = frame.Payload.Select(b => G711.Decode(b, _session!.Codec == "PCMA")).ToArray();
+                else { _lost++; samples = new short[160]; }
+                var resampled = _rxResampler.Process(samples);
+                _received.Writer.TryWrite(new(resampled, SampleRate, _samplePosition)); _samplePosition += resampled.Length;
+            }
+        }
+    }
+    private async Task MetricsAsync(CancellationToken cancellationToken)
+    {
+        using var timer = new PeriodicTimer(TimeSpan.FromSeconds(1), _time);
+        while (await timer.WaitForNextTickAsync(cancellationToken))
+            foreach (EventHandler<SipMediaMetrics> handler in MetricsChanged?.GetInvocationList() ?? [])
+                try { handler(this, Metrics); } catch { }
+    }
+    public async ValueTask DisposeAsync()
+    {
+        lock (_gate) { if (_disposed) return; _disposed = true; _stop.Cancel(); _outbound.Clear(); }
+        _rtp.Dispose(); await Task.WhenAll(_tasks); _received.Writer.TryComplete();
+        _txCrypto?.Dispose(); _rxCrypto?.Dispose();
+        if (_masterKey is not null) CryptographicOperations.ZeroMemory(_masterKey);
+        if (_session?.MasterKey is { } remoteKey) CryptographicOperations.ZeroMemory(remoteKey);
+        _stop.Dispose();
+    }
+}

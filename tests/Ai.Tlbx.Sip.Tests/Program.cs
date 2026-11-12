@@ -1,0 +1,173 @@
+using System.Buffers.Binary;
+using System.Net;
+using System.Security.Cryptography;
+using System.Text;
+using Ai.Tlbx.Sip;
+using Ai.Tlbx.Sip.Media;
+using Ai.Tlbx.Sip.Protocol;
+using Ai.Tlbx.VoiceAssistant.Sip;
+
+var cases = new (string Name, Func<Task> Run)[]
+{
+    ("SIP framing, UTF-8, compact and repeated headers", () =>
+    {
+        var m = new SipMessage { StartLine = "MESSAGE sip:x@example.test SIP/2.0", Body = Encoding.UTF8.GetBytes("Grüße") };
+        m.Add("Via", "a"); m.Add("Via", "b");
+        byte[] bytes = m.Serialize(); var parsed = SipMessage.Parse(bytes);
+        Check.That(parsed.GetAll("Via").SequenceEqual(["a", "b"]));
+        Check.That(parsed.Body.SequenceEqual(m.Body));
+        Check.That(SipMessage.TryGetLength(bytes.AsSpan(0, bytes.Length - 1), out int length, out _) && length == bytes.Length);
+        var compact = SipMessage.Parse("OPTIONS sip:x@example.test SIP/2.0\r\nv: SIP/2.0/UDP host;branch=z9hG4bKx\r\ni: call\r\nCSeq: 1 OPTIONS\r\nl: 0\r\n\r\n"u8);
+        Check.That(compact.Get("Call-ID") == "call" && compact.TransactionKey == "z9hG4bKx:1 OPTIONS");
+        Check.Throws<InvalidDataException>(() => SipMessage.Parse("OPTIONS sip:x SIP/2.0\r\nContent-Length: 0\r\nl: 3\r\n\r\n"u8));
+        Check.Throws<ArgumentException>(() => m.Add("From", "x\r\nInjected: yes"));
+        return Task.CompletedTask;
+    }),
+    ("G.711 published silence and endpoint values", () =>
+    {
+        Check.That(G711.Decode(0xFF, false) == 0 && G711.Decode(0x7F, false) == 0);
+        Check.That(G711.Decode(0x00, false) == -32124 && G711.Decode(0x80, false) == 32124);
+        Check.That(G711.Decode(0xD5, true) == 8 && G711.Decode(0x55, true) == -8);
+        Check.That(G711.Encode(0, true) == 0xD5 && G711.Encode(0, false) == 0xFF);
+        return Task.CompletedTask;
+    }),
+    ("Resampling preserves stream length and packet-boundary continuity", () =>
+    {
+        foreach (var rates in new[] { (24000, 8000), (8000, 24000), (16000, 24000), (24000, 48000), (44100, 24000) })
+        {
+            var input = Enumerable.Range(0, rates.Item1).Select(i => (short)(10000 * Math.Sin(2 * Math.PI * 997 * i / rates.Item1))).ToArray();
+            var whole = new PcmResampler(rates.Item1, rates.Item2).Process(input, true);
+            var chunked = new PcmResampler(rates.Item1, rates.Item2); var result = new List<short>();
+            for (int i = 0; i < input.Length; i += 137) result.AddRange(chunked.Process(input.AsSpan(i, Math.Min(137, input.Length - i))));
+            result.AddRange(chunked.Process([], true));
+            Check.That(whole.Length == rates.Item2 && result.SequenceEqual(whole), $"{rates} chunk continuity");
+        }
+        return Task.CompletedTask;
+    }),
+    ("Downsampling rejects out-of-band energy", () =>
+    {
+        static double Rms(int frequency)
+        {
+            var input = Enumerable.Range(0, 24000).Select(i => (short)(12000 * Math.Sin(2 * Math.PI * frequency * i / 24000))).ToArray();
+            var output = new PcmResampler(24000, 8000).Process(input, true);
+            return Math.Sqrt(output.Skip(100).Take(7800).Average(s => (double)s * s));
+        }
+        Check.That(Rms(1000) > 8000); Check.That(Rms(6000) < 50, "alias rejection"); return Task.CompletedTask;
+    }),
+    ("RFC 3711 key-derivation vectors and SRTP replay/authentication", () =>
+    {
+        byte[] key = Convert.FromHexString("E1F97A0D3E018BE0D64FA32C06DE4139"), salt = Convert.FromHexString("0EC675AD498AFEEBB6960B3AABE6");
+        Check.That(Convert.ToHexString(SrtpContext.Derive(key, salt, 0, 16)) == "C61E7A93744F39EE10734AFE3FF7A087");
+        Check.That(Convert.ToHexString(SrtpContext.Derive(key, salt, 1, 20)) == "CEBE321F6FF7716B6FD4AB49AF256A156D38BAA4");
+        Check.That(Convert.ToHexString(SrtpContext.Derive(key, salt, 2, 14)) == "30CBBC08863D8C85D49DB34A9AE1");
+        using var tx = new SrtpContext([..key, ..salt]); using var rx = new SrtpContext([..key, ..salt]);
+        foreach (ushort sequence in new ushort[] { 65534, 65535, 0, 1 })
+        {
+            byte[] packet = Check.Rtp(sequence, (uint)sequence * 160, [1, 2, 3, 4]);
+            var encrypted = tx.Protect(packet, 12);
+            var corrupt = encrypted.ToArray(); corrupt[^1] ^= 1;
+            Check.That(rx.Unprotect(corrupt, 12) is null, "reject tampering");
+            Check.That(rx.Unprotect(encrypted, 12)!.SequenceEqual(packet), "rollover/decryption");
+            Check.That(rx.Unprotect(encrypted, 12) is null, "reject replay");
+        }
+        return Task.CompletedTask;
+    }),
+    ("SDP media selection and encryption downgrade rejection", () =>
+    {
+        var sdp = Encoding.UTF8.GetBytes(SdpSession.Offer(IPAddress.Loopback, 4000, null, 1));
+        var parsed = SdpSession.Parse(sdp, SipMediaSecurity.Unencrypted);
+        Check.That(parsed.Codec == "PCMA" && parsed.SampleRate == 8000 && parsed.Port == 4000);
+        Check.Throws<InvalidDataException>(() => SdpSession.Parse(sdp, SipMediaSecurity.SdesRequired));
+        Check.That(SipCallAudio.RtpHeaderLength([0x80, 8]) == -1);
+        return Task.CompletedTask;
+    }),
+    ("Manager configuration loading is atomic and credentials redact", async () =>
+    {
+        await using var manager = new SipClientManager();
+        var config = Check.Config(5060); manager.CreateClient(config);
+        Check.Throws<ArgumentException>(() => manager.LoadClients([config, config]));
+        Check.That(manager.Clients.Count == 1 && !config.Credentials.ToString().Contains("test-password"));
+        Check.That(await manager.RemoveClientAsync(config.Id)); Check.That(manager.Clients.Count == 0);
+    }),
+    ("UDP retransmission, SHA-256 authentication and unregister", async () =>
+    {
+        await using var pbx = new TestPbx { DropFirstRegister = true };
+        await using var manager = new SipClientManager(); var client = manager.CreateClient(Check.Config(pbx.Port));
+        await client.ConnectAsync().WaitAsync(TimeSpan.FromSeconds(5));
+        Check.That(client.Status.State == SipClientState.Connected && pbx.RegisterRequests >= 3 && pbx.AuthenticatedRegistrations > 0);
+        await client.DisconnectAsync();
+        Check.That(client.Status.State == SipClientState.Disconnected && pbx.Unregistered);
+    }),
+    ("Wrong credentials cannot establish Connected", async () =>
+    {
+        await using var pbx = new TestPbx { RejectCredentials = true };
+        await using var manager = new SipClientManager(); var client = manager.CreateClient(Check.Config(pbx.Port));
+        try { await client.ConnectAsync().WaitAsync(TimeSpan.FromSeconds(5)); throw new Exception("Expected rejection."); }
+        catch (SipException e) { Check.That(e.StatusCode == 403); }
+        Check.That(client.Status.State == SipClientState.Failed);
+    }),
+    ("Outgoing call, bidirectional paced PCM and VoiceAssistant adapter", async () =>
+    {
+        await using var pbx = new TestPbx(); await using var manager = new SipClientManager();
+        var client = manager.CreateClient(Check.Config(pbx.Port)); await client.ConnectAsync();
+        var call = client.CreateCall("123");
+        await call.StartAsync().WaitAsync(TimeSpan.FromSeconds(5));
+        Check.That(call.Status.State == SipCallState.Established);
+        await using var adapter = new SipAudioHardwareAccess(call);
+        var pcm = new TaskCompletionSource<int>(TaskCreationOptions.RunContinuationsAsynchronously);
+        await adapter.StartRecordingAudio((_, e) => pcm.TrySetResult(Convert.FromBase64String(e.Base64EncodedPcm16Audio).Length));
+        Check.That(adapter.PlayAudio(Convert.ToBase64String(new byte[4800]), 24000));
+        await pbx.SendAudioAsync();
+        Check.That(await pcm.Task.WaitAsync(TimeSpan.FromSeconds(3)) > 0);
+        Check.That(await adapter.WaitForPlaybackDrainAsync(TimeSpan.FromSeconds(3)));
+        Check.That(call.Metrics.ReceivedPackets >= 3 && call.Metrics.TransmittedPackets >= 3);
+        await adapter.StopRecordingAudio();
+        await call.HangupAsync(); Check.That(call.Status.EndReason == SipCallEndReason.LocalHangup && client.Calls.Count == 0);
+        await client.DisconnectAsync();
+    }),
+    ("Incoming call event, duplicate INVITE, answer, ACK and remote BYE", async () =>
+    {
+        await using var pbx = new TestPbx(); await using var manager = new SipClientManager();
+        var client = manager.CreateClient(Check.Config(pbx.Port)); await client.ConnectAsync();
+        var incoming = new TaskCompletionSource<SipCall>(TaskCreationOptions.RunContinuationsAsynchronously); int events = 0;
+        client.IncomingCall += (_, call) => { Interlocked.Increment(ref events); incoming.TrySetResult(call); };
+        var invite = await pbx.InviteAsync();
+        var call = await incoming.Task.WaitAsync(TimeSpan.FromSeconds(3));
+        await pbx.SendAsync(invite); await Task.Delay(50);
+        Check.That(events == 1 && client.Calls.Count == 1);
+        var answering = call.AnswerAsync();
+        var answer = await pbx.WaitResponseAsync("INVITE", 200);
+        await pbx.AckAsync(invite, answer); await answering.WaitAsync(TimeSpan.FromSeconds(3));
+        Check.That(call.Status.State == SipCallState.Established);
+        await pbx.ByeAsync(invite, answer); await call.Completion.WaitAsync(TimeSpan.FromSeconds(3));
+        Check.That(call.Status.EndReason == SipCallEndReason.RemoteHangup);
+        await client.DisconnectAsync();
+    })
+};
+int failed = 0;
+foreach (var test in cases)
+{
+    try { await test.Run().WaitAsync(TimeSpan.FromSeconds(15)); Console.WriteLine($"PASS {test.Name}"); }
+    catch (Exception error) { failed++; Console.WriteLine($"FAIL {test.Name}: {error}"); }
+}
+Console.WriteLine($"{cases.Length - failed}/{cases.Length} passed");
+Environment.ExitCode = failed == 0 ? 0 : 1;
+
+internal static class Check
+{
+    public static void That(bool condition, string? message = null) { if (!condition) throw new Exception(message ?? "Assertion failed."); }
+    public static void Throws<T>(Action action) where T : Exception
+    { try { action(); } catch (T) { return; } throw new Exception($"Expected {typeof(T).Name}"); }
+    public static SipClientConfig Config(int port) => new()
+    {
+        Id = "test", Registrar = "127.0.0.1", Port = port, User = "test-user", Domain = "example.test",
+        Credentials = new() { Username = "test-user", Password = "test-password" }, LocalAddress = IPAddress.Loopback,
+        AutoReconnect = false, TransactionTimeout = TimeSpan.FromSeconds(2), InitialRetransmitInterval = TimeSpan.FromMilliseconds(50)
+    };
+    public static byte[] Rtp(ushort sequence, uint timestamp, byte[] payload)
+    {
+        byte[] data = new byte[12 + payload.Length]; data[0] = 0x80; data[1] = 8;
+        BinaryPrimitives.WriteUInt16BigEndian(data.AsSpan(2), sequence); BinaryPrimitives.WriteUInt32BigEndian(data.AsSpan(4), timestamp);
+        BinaryPrimitives.WriteUInt32BigEndian(data.AsSpan(8), 42); payload.CopyTo(data, 12); return data;
+    }
+}

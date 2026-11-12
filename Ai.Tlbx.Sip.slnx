@@ -1,0 +1,6 @@
+<Solution>
+  <Project Path="src/Ai.Tlbx.Sip/Ai.Tlbx.Sip.csproj" />
+  <Project Path="src/Ai.Tlbx.VoiceAssistant.Sip/Ai.Tlbx.VoiceAssistant.Sip.csproj" />
+  <Project Path="tests/Ai.Tlbx.Sip.Tests/Ai.Tlbx.Sip.Tests.csproj" />
+  <Project Path="samples/SipConsole/SipConsole.csproj" />
+</Solution>

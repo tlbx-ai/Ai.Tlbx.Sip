@@ -1,0 +1,9 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <Description>Managed SIP user agents, call control and bidirectional PCM media for Windows and Linux.</Description>
+    <AllowUnsafeBlocks>false</AllowUnsafeBlocks>
+  </PropertyGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="Ai.Tlbx.Sip.Tests" />
+  </ItemGroup>
+</Project>
