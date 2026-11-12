@@ -12,7 +12,9 @@ Push-Location $PSScriptRoot
 try {
     [xml]$props = Get-Content Directory.Build.props
     $version = [string]$props.Project.PropertyGroup.Version
+    $adapterVersion = [string]$props.Project.PropertyGroup.VoiceAssistantVersion
     if ($version -notmatch '^\d+\.\d+\.\d+$') { throw 'A stable semantic version is required.' }
+    if ($adapterVersion -notmatch '^\d+\.\d+\.\d+$') { throw 'A stable VoiceAssistant version is required.' }
     $output = [IO.Path]::GetFullPath($OutputDirectory)
     $feed = Join-Path $output $version
     New-Item -ItemType Directory -Force $feed | Out-Null
@@ -21,14 +23,15 @@ try {
         Invoke-Dotnet @('run', '--project', 'tests/Ai.Tlbx.Sip.Tests', '-c', 'Release', '-f', $framework, '--no-build')
     }
     foreach ($id in @('Ai.Tlbx.Sip', 'Ai.Tlbx.VoiceAssistant.Sip')) {
+        $packageVersion = if ($id -eq 'Ai.Tlbx.Sip') { $version } else { $adapterVersion }
         Invoke-Dotnet @('pack', "src/$id", '-c', 'Release', '--no-build', '-o', $feed)
-        $archive = [IO.Compression.ZipFile]::OpenRead((Join-Path $feed "$id.$version.nupkg"))
+        $archive = [IO.Compression.ZipFile]::OpenRead((Join-Path $feed "$id.$packageVersion.nupkg"))
         try {
             $entry = @($archive.Entries | Where-Object FullName -like '*.nuspec')
             if ($entry.Count -ne 1) { throw 'Invalid package manifest count.' }
             $reader = [IO.StreamReader]::new($entry[0].Open())
             try { [xml]$manifest = $reader.ReadToEnd() } finally { $reader.Dispose() }
-            if ($manifest.package.metadata.id -ne $id -or $manifest.package.metadata.version -ne $version -or
+            if ($manifest.package.metadata.id -ne $id -or $manifest.package.metadata.version -ne $packageVersion -or
                 $manifest.package.metadata.license.InnerText -ne 'MIT') { throw 'Package identity/version/license mismatch.' }
             if (-not $archive.GetEntry('README.md')) { throw 'Missing package readme.' }
             foreach ($framework in @('net10.0', 'net11.0')) {
@@ -38,6 +41,10 @@ try {
                     $dependency = @($group.dependency | Where-Object id -eq 'Ai.Tlbx.Sip')
                     if ($dependency.Count -ne 1 -or $dependency[0].version.Trim([char[]]'[]() ') -ne $version) {
                         throw 'Adapter must reference this exact minimum SIP version on each target.'
+                    }
+                    $voiceDependency = @($group.dependency | Where-Object id -eq 'Ai.Tlbx.VoiceAssistant')
+                    if ($voiceDependency.Count -ne 1 -or $voiceDependency[0].version.Trim([char[]]'[]() ') -ne $adapterVersion) {
+                        throw 'Adapter package and VoiceAssistant dependency versions must align.'
                     }
                 }
             }
@@ -51,7 +58,7 @@ try {
     @"
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup><OutputType>Exe</OutputType><TargetFrameworks>net10.0;net11.0</TargetFrameworks><ImplicitUsings>enable</ImplicitUsings><Nullable>enable</Nullable><TreatWarningsAsErrors>true</TreatWarningsAsErrors></PropertyGroup>
-  <ItemGroup><PackageReference Include="Ai.Tlbx.VoiceAssistant.Sip" Version="[$version]" /></ItemGroup>
+  <ItemGroup><PackageReference Include="Ai.Tlbx.VoiceAssistant.Sip" Version="[$adapterVersion]" /></ItemGroup>
 </Project>
 "@ | Set-Content $project
     @'
@@ -77,10 +84,11 @@ Console.WriteLine("PASS isolated package consumer (no project references or netw
     foreach ($framework in @('net10.0', 'net11.0')) {
         Invoke-Dotnet @('run', '--project', $project, '-c', 'Release', '-f', $framework, '--no-restore')
     }
-    $records = @(Get-ChildItem $feed -Filter '*.nupkg' | ForEach-Object {
-        [ordered]@{ file = $_.Name; sha256 = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant(); bytes = $_.Length }
+    $records = @(foreach ($name in @("Ai.Tlbx.Sip.$version.nupkg", "Ai.Tlbx.VoiceAssistant.Sip.$adapterVersion.nupkg")) {
+        $package = Get-Item (Join-Path $feed $name)
+        [ordered]@{ file = $package.Name; sha256 = (Get-FileHash $package.FullName -Algorithm SHA256).Hash.ToLowerInvariant(); bytes = $package.Length }
     })
     if ($records.Count -ne 2) { throw 'Expected exactly two release packages.' }
-    [ordered]@{ version = $version; packages = $records; consumer = $consumer } | ConvertTo-Json -Depth 5 | Set-Content (Join-Path $feed 'verification.json')
+    [ordered]@{ version = $version; adapterVersion = $adapterVersion; packages = $records; targetFrameworks = @('net10.0','net11.0') } | ConvertTo-Json -Depth 5 | Set-Content (Join-Path $feed 'verification.json')
     Write-Output "Verified release packages: $feed"
 } finally { Pop-Location }

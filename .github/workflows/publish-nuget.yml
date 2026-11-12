@@ -3,7 +3,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: Exact stable version committed in Directory.Build.props
+        description: Exact SIP core version committed in Directory.Build.props
         required: true
         type: string
       publish:
@@ -65,6 +65,12 @@ jobs:
         run: |
           dotnet pack src/Ai.Tlbx.Sip -c Release -o artifacts/nuget
           dotnet pack src/Ai.Tlbx.VoiceAssistant.Sip -c Release -o artifacts/nuget
+      - name: Read adapter version
+        id: versions
+        shell: pwsh
+        run: |
+          [xml]$props = Get-Content Directory.Build.props
+          "adapter=$($props.Project.PropertyGroup.VoiceAssistantVersion)" >> $env:GITHUB_OUTPUT
       - name: NuGet login with GitHub OIDC
         id: login
         uses: NuGet/login@ebc737b6fc418a6ca0073cf116ec8dc156d8b81e # v1
@@ -75,9 +81,10 @@ jobs:
         env:
           NUGET_API_KEY: ${{ steps.login.outputs.NUGET_API_KEY }}
           RELEASE_VERSION: ${{ inputs.version }}
+          ADAPTER_VERSION: ${{ steps.versions.outputs.adapter }}
         run: |
           dotnet nuget push "artifacts/nuget/Ai.Tlbx.Sip.$RELEASE_VERSION.nupkg" --api-key "$NUGET_API_KEY" --source https://api.nuget.org/v3/index.json --skip-duplicate
-          dotnet nuget push "artifacts/nuget/Ai.Tlbx.VoiceAssistant.Sip.$RELEASE_VERSION.nupkg" --api-key "$NUGET_API_KEY" --source https://api.nuget.org/v3/index.json --skip-duplicate
+          dotnet nuget push "artifacts/nuget/Ai.Tlbx.VoiceAssistant.Sip.$ADAPTER_VERSION.nupkg" --api-key "$NUGET_API_KEY" --source https://api.nuget.org/v3/index.json --skip-duplicate
       - name: Report verified preparation
         if: ${{ !inputs.publish }}
         run: echo 'Both platform gates and NuGet OIDC login succeeded. No packages submitted.' >> "$GITHUB_STEP_SUMMARY"

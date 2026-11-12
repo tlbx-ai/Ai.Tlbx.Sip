@@ -23,10 +23,10 @@ Both packages target .NET 10 and .NET 11 (`net10.0;net11.0`). Build from source 
 ```sh
 dotnet add package Ai.Tlbx.Sip --version 1.0.0
 # Optional AI audio adapter (also installs the SIP core):
-dotnet add package Ai.Tlbx.VoiceAssistant.Sip --version 1.0.0
+dotnet add package Ai.Tlbx.VoiceAssistant.Sip --version 11.9.0
 ```
 
-Until the initial publication completes, build from source or use the locally verified packages produced by `verify-release.ps1`.
+The SIP core uses its own version series (`1.0.0`). The adapter follows the VoiceAssistant version it integrates with (`11.9.0`). `VoiceAssistantVersion` in `Directory.Build.props` controls both the adapter package version and its VoiceAssistant dependency; the core dependency retains its independent version. Both packages contain `net10.0` and `net11.0` assemblies.
 
 ## Create and connect a client
 
