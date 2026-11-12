@@ -128,7 +128,7 @@ IAudioHardwareAccess audio = hardware;
 // Supply audio to your application's VoiceAssistant composition.
 ```
 
-Create one adapter per call. It converts PCM16 to/from the VoiceAssistant base64 interface and resamples received audio to the requested provider input rate. Disposing the adapter stops its reader; call ownership remains with the application.
+Create one adapter per call. It converts PCM16 to/from the VoiceAssistant base64 interface and resamples received audio to the requested provider input rate. AI output may arrive faster than real time: the adapter retains accepted chunks in order and feeds small slices into the paced SIP queue without discarding their middle. `BufferedAudio` includes both queues. The default limit is one minute of unsent audio; pass `maxBufferedAudio` to configure 20 ms to five minutes. At the limit, `PlayAudio` rejects the entire new chunk and raises `AudioError`. The synchronous provider callback has no asynchronous backpressure contract, so the limit remains explicit. `ClearAudioQueueAsync` atomically clears both queues for interruption; drain waits include both queues. Disposing the adapter stops its reader and sender and clears pending audio; call ownership remains with the application.
 
 ## Transport and security
 

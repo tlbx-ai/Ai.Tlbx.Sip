@@ -211,6 +211,23 @@ var cases = new (string Name, Func<Task> Run)[]
         Check.That(await pcm.Task.WaitAsync(TimeSpan.FromSeconds(3)) > 0);
         Check.That(await adapter.WaitForPlaybackDrainAsync(TimeSpan.FromSeconds(3)));
         Check.That(call.Metrics.ReceivedPackets >= 3 && call.Metrics.TransmittedPackets >= 3);
+        // AI producers run faster than playback. An interruption must clear both
+        // the adapter backlog and the SIP queue, including a blocked sender slice.
+        Check.That(adapter.PlayAudio(Convert.ToBase64String(new byte[24000 * 8]), 24000));
+        Check.That(!await adapter.WaitForPlaybackDrainAsync(TimeSpan.FromMilliseconds(40)));
+        await adapter.ClearAudioQueueAsync();
+        await Task.Delay(80);
+        Check.That(adapter.BufferedAudio == TimeSpan.Zero && call.Audio.QueuedAudio == TimeSpan.Zero, "Interrupted audio was reintroduced by the adapter.");
+        await using (var limited = new SipAudioHardwareAccess(call, TimeSpan.FromMilliseconds(700)))
+        {
+            int errors = 0; limited.AudioError += (_, _) => errors++;
+            Check.That(limited.PlayAudio(Convert.ToBase64String(new byte[24000]), 24000));
+            Check.That(!limited.PlayAudio(Convert.ToBase64String(new byte[24000]), 24000));
+            Check.That(errors == 1 && limited.BufferedAudio <= TimeSpan.FromMilliseconds(700), "Adapter limit must reject visibly without exceeding its bound.");
+            await limited.ClearAudioQueueAsync();
+            Check.That(limited.PlayAudio(Convert.ToBase64String(new byte[4800]), 24000));
+            Check.That(await limited.WaitForPlaybackDrainAsync(TimeSpan.FromSeconds(2)));
+        }
         await adapter.StopRecordingAudio();
         await call.HangupAsync(); Check.That(call.Status.EndReason == SipCallEndReason.LocalHangup && client.Calls.Count == 0);
         Check.That(!call.Audio.TryWrite(new short[480], 24000), "A closing audio producer must safely reject a trailing frame.");
