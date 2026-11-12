@@ -333,12 +333,13 @@ var cases = new (string Name, Func<Task> Run)[]
     })
 };
 int failed = 0;
-foreach (var test in cases)
+var allCases = cases.Concat(RtcpTests.Cases).ToArray();
+foreach (var test in allCases)
 {
     try { await test.Run().WaitAsync(TimeSpan.FromSeconds(15)); Console.WriteLine($"PASS {test.Name}"); }
     catch (Exception error) { failed++; Console.WriteLine($"FAIL {test.Name}: {error}"); }
 }
-Console.WriteLine($"{cases.Length - failed}/{cases.Length} passed");
+Console.WriteLine($"{allCases.Length - failed}/{allCases.Length} passed");
 Environment.ExitCode = failed == 0 ? 0 : 1;
 
 internal static class Check

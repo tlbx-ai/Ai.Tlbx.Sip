@@ -10,9 +10,11 @@ internal sealed class TestPbx : IAsyncDisposable
 {
     private readonly UdpClient _sip = new(new IPEndPoint(IPAddress.Loopback, 0));
     private readonly UdpClient _rtp = new(new IPEndPoint(IPAddress.Loopback, 0));
+    private readonly UdpClient _rtcp = new(new IPEndPoint(IPAddress.Loopback, 0));
     private readonly CancellationTokenSource _stop = new();
     private readonly Channel<SipMessage> _responses = Channel.CreateUnbounded<SipMessage>();
     private readonly Task _loop;
+    private readonly Task _controlLoop;
     private IPEndPoint? _client, _clientMedia;
     private ushort _mediaSequence;
     private uint _mediaTimestamp;
@@ -40,7 +42,13 @@ internal sealed class TestPbx : IAsyncDisposable
     public int RegisterRequests { get; private set; }
     public int AuthenticatedRegistrations { get; private set; }
     public bool Unregistered { get; private set; }
-    public TestPbx() => _loop = RunAsync();
+    public TestPbx() { _loop = RunAsync(); _controlLoop = DrainControlAsync(); }
+    private async Task DrainControlAsync()
+    {
+        try { while (!_stop.IsCancellationRequested) await _rtcp.ReceiveAsync(_stop.Token); }
+        catch (OperationCanceledException) when (_stop.IsCancellationRequested) { }
+        catch (ObjectDisposedException) when (_stop.IsCancellationRequested) { }
+    }
     private async Task RunAsync()
     {
         try
@@ -169,8 +177,8 @@ internal sealed class TestPbx : IAsyncDisposable
         }
     }
     public void AdvanceMediaClock(int milliseconds) => _mediaTimestamp += (uint)(milliseconds * 8);
-    private string TestSdp() => UseG722 ? SdpSession.Offer(IPAddress.Loopback, MediaPort, null, 1)
-        : SdpSession.Offer(IPAddress.Loopback, MediaPort, null, 1).Replace(" 9 8 0\r\n", " 8 0\r\n").Replace("a=rtpmap:9 G722/8000\r\n", "");
+    private string TestSdp() => UseG722 ? SdpSession.Offer(IPAddress.Loopback, MediaPort, null, 1, ((IPEndPoint)_rtcp.Client.LocalEndPoint!).Port)
+        : SdpSession.Offer(IPAddress.Loopback, MediaPort, null, 1, ((IPEndPoint)_rtcp.Client.LocalEndPoint!).Port).Replace(" 9 8 0\r\n", " 8 0\r\n").Replace("a=rtpmap:9 G722/8000\r\n", "");
     public async ValueTask DisposeAsync()
-    { _stop.Cancel(); _sip.Dispose(); _rtp.Dispose(); await _loop; _responses.Writer.TryComplete(); _stop.Dispose(); }
+    { _stop.Cancel(); _sip.Dispose(); _rtp.Dispose(); _rtcp.Dispose(); await Task.WhenAll(_loop, _controlLoop); _responses.Writer.TryComplete(); _stop.Dispose(); }
 }

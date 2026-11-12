@@ -5,13 +5,16 @@ using System.Text;
 namespace Ai.Tlbx.Sip.Protocol;
 
 internal sealed record SdpSession(IPAddress Address, int Port, int PayloadType, string Codec,
-    int SampleRate, bool Secure, byte[]? MasterKey, int CryptoTag = 1)
+    int SampleRate, bool Secure, byte[]? MasterKey, int CryptoTag = 1, IPAddress? ControlAddress = null, int? ControlPort = null)
 {
-    public static string Offer(IPAddress address, int port, byte[]? key, long sessionId)
+    public IPAddress RtcpAddress => ControlAddress ?? Address;
+    public int RtcpPort => ControlPort ?? Port + 1;
+    public static string Offer(IPAddress address, int port, byte[]? key, long sessionId, int? rtcpPort = null)
     {
         string family = address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetworkV6 ? "IP6" : "IP4";
         var text = new StringBuilder($"v=0\r\no=- {sessionId} {sessionId} IN {family} {address}\r\ns=Ai.Tlbx.Sip\r\nc=IN {family} {address}\r\nt=0 0\r\nm=audio {port} RTP/{(key is null ? "AVP" : "SAVP")} 9 8 0\r\na=rtpmap:9 G722/8000\r\na=rtpmap:8 PCMA/8000\r\na=rtpmap:0 PCMU/8000\r\na=ptime:20\r\na=sendrecv\r\n");
         if (key is not null) text.Append($"a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{Convert.ToBase64String(key)}\r\n");
+        text.Append($"a=rtcp:{rtcpPort ?? port + 1} IN {family} {address}\r\n");
         return text.ToString();
     }
     public static string Answer(IPAddress address, int port, byte[]? key, long sessionId, SdpSession remote)
@@ -50,6 +53,23 @@ internal sealed record SdpSession(IPAddress Address, int Port, int PayloadType, 
         if (parts[2] is not ("RTP/AVP" or "RTP/SAVP")) throw new NotSupportedException("Unsupported SDP media transport.");
         if (secure != (security == SipMediaSecurity.SdesRequired)) throw new InvalidDataException("Media encryption does not match the required security policy.");
         if (attributes.Any(a => a is "inactive" or "sendonly" or "recvonly")) throw new NotSupportedException("This session requires bidirectional audio.");
+        if (attributes.Contains("rtcp-mux-only")) throw new NotSupportedException("RTCP multiplexing is not supported.");
+        var control = attributes.Where(a => a.StartsWith("rtcp:", StringComparison.Ordinal)).ToArray();
+        IPAddress? controlAddress = null; int? controlPort = null;
+        if (control.Length > 1) throw new InvalidDataException("Ambiguous RTCP endpoint.");
+        if (control.Length == 1)
+        {
+            var endpoint = control[0][5..].Split(' ', StringSplitOptions.RemoveEmptyEntries);
+            if (endpoint.Length is not (1 or 4) || !int.TryParse(endpoint[0], out int value) || value is < 1 or > 65535)
+                throw new InvalidDataException("Invalid RTCP port.");
+            controlPort = value;
+            if (endpoint.Length == 4)
+            {
+                if (endpoint[1] != "IN" || endpoint[2] is not ("IP4" or "IP6") || !IPAddress.TryParse(endpoint[3], out controlAddress) ||
+                    (endpoint[2] == "IP4") != (controlAddress.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork))
+                    throw new InvalidDataException("Invalid RTCP connection address.");
+            }
+        }
         int payload = -1; string codec = "";
         foreach (string p in parts.Skip(3))
         {
@@ -75,7 +95,7 @@ internal sealed record SdpSession(IPAddress Address, int Port, int PayloadType, 
             }
             if (masterKey is null) throw new NotSupportedException("No supported SRTP crypto attribute was offered.");
         }
-        return new(address, port, payload, codec, codec == "G722" ? 16000 : 8000, secure, masterKey, tag);
+        return new(address, port, payload, codec, codec == "G722" ? 16000 : 8000, secure, masterKey, tag, controlAddress, controlPort);
     }
     public static byte[] NewMasterKey() => RandomNumberGenerator.GetBytes(30);
 }

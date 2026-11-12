@@ -9,12 +9,13 @@ internal sealed class SrtpContext : IDisposable
     private readonly byte[] _encryption, _authentication, _salt;
     private long _highest = -1;
     private ulong _replay;
-    public SrtpContext(ReadOnlySpan<byte> master)
+    public SrtpContext(ReadOnlySpan<byte> master, bool control = false)
     {
         if (master.Length != 30) throw new ArgumentException("SRTP requires a 16-byte key and 14-byte salt.");
-        _encryption = Derive(master[..16], master[16..], 0, 16);
-        _authentication = Derive(master[..16], master[16..], 1, 20);
-        _salt = Derive(master[..16], master[16..], 2, 14);
+        byte label = control ? (byte)3 : (byte)0;
+        _encryption = Derive(master[..16], master[16..], label, 16);
+        _authentication = Derive(master[..16], master[16..], (byte)(label + 1), 20);
+        _salt = Derive(master[..16], master[16..], (byte)(label + 2), 14);
     }
     internal static byte[] Derive(ReadOnlySpan<byte> key, ReadOnlySpan<byte> salt, byte label, int length)
     {
@@ -41,7 +42,7 @@ internal sealed class SrtpContext : IDisposable
         else if (last >= 32768 && last - sequence > 32768) roc++;
         return (roc << 16) | sequence;
     }
-    private void Crypt(Span<byte> payload, uint ssrc, long index)
+    internal void Crypt(Span<byte> payload, uint ssrc, long index)
     {
         byte[] iv = new byte[16]; _salt.CopyTo(iv, 0);
         Span<byte> mask = stackalloc byte[16]; mask.Clear();
@@ -53,6 +54,7 @@ internal sealed class SrtpContext : IDisposable
         for (int i = 0; i < payload.Length; i++) payload[i] ^= stream[i];
         CryptographicOperations.ZeroMemory(stream);
     }
+    internal byte[] AuthenticationTag(ReadOnlySpan<byte> bytes) => HMACSHA1.HashData(_authentication, bytes);
     public byte[] Protect(ReadOnlySpan<byte> packet, int headerLength)
     {
         ushort sequence = BinaryPrimitives.ReadUInt16BigEndian(packet[2..]);

@@ -41,6 +41,7 @@ public sealed class SipClientConfig
     public int MaxConcurrentCalls { get; init; } = 4;
     public int AudioSampleRate { get; init; } = 24000;
     public TimeSpan MaxQueuedAudio { get; init; } = TimeSpan.FromSeconds(3);
+    public TimeSpan RtcpReportInterval { get; init; } = TimeSpan.FromSeconds(5);
     public bool AllowSymmetricRtp { get; init; }
 
     internal string SipDomain => Domain ?? Registrar;
@@ -62,6 +63,8 @@ public sealed class SipClientConfig
             InitialRetransmitInterval <= TimeSpan.Zero || ReconnectDelay <= TimeSpan.Zero ||
             MaxQueuedAudio < TimeSpan.FromMilliseconds(20) || MaxQueuedAudio > TimeSpan.FromMinutes(1))
             throw new ArgumentOutOfRangeException(nameof(SipClientConfig));
+        if (RtcpReportInterval < TimeSpan.FromSeconds(1) || RtcpReportInterval > TimeSpan.FromMinutes(1))
+            throw new ArgumentOutOfRangeException(nameof(RtcpReportInterval));
         if (MediaSecurity == SipMediaSecurity.SdesRequired && Transport != SipTransportProtocol.Tls)
             throw new ArgumentException("SDES key exchange requires TLS-protected signalling.");
     }
@@ -75,5 +78,8 @@ public sealed record SipCallStatus(SipCallState State, DateTimeOffset ChangedAt,
 public sealed record SipMediaMetrics(long TransmittedPackets, long ReceivedPackets, long TransmittedBytes,
     long ReceivedBytes, long LostPackets, long DuplicatePackets, long LatePackets,
     double JitterMilliseconds, double? RoundTripMilliseconds, TimeSpan QueuedAudio,
-    long PlaybackUnderruns, string? Codec);
+    long PlaybackUnderruns, string? Codec, SipRtcpMetrics? Control = null);
+public sealed record SipRtcpMetrics(long TransmittedPackets, long ReceivedPackets, long RejectedPackets,
+    long? RemoteLostPackets, double? RemoteLossFraction, double? RemoteJitterMilliseconds, DateTimeOffset? LastReportAt,
+    long TransportErrors = 0);
 public sealed record SipDiagnostic(DateTimeOffset At, string Category, string Message);

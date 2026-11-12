@@ -6,6 +6,8 @@ The SIP library handles telephony. Applications decide whether to connect a call
 
 > **Early development.** Protocol and media tests pass on Windows and Linux against a simulated PBX. Real FRITZ!Box testing covers registration, incoming and outgoing calls, bidirectional echo audio, remote hangup, and clean unregistration. An outgoing G.722 acceptance call sustained approximately 2,800 packets in each direction without detected sequence loss; the listener confirmed continuous, clear audio with a stable perceived delay. The first incoming test had approximately one second of perceived round-trip delay; latency has not yet been attributed to individual components. easybell interoperability, security review, and broader failure-mode coverage are still pending. Do not treat this initial implementation as production-ready.
 
+RTCP/SRTCP was added after that FRITZ!Box acceptance and is verified against local network peers and independent encryption vectors. This newer control path has not yet been retested against a real PBX.
+
 ## Projects
 
 | Project | Purpose |
@@ -107,7 +109,11 @@ bool drained = await call.Audio.WaitForDrainAsync(TimeSpan.FromSeconds(5));
 
 `TryWrite` copies/resamples accepted samples and returns `false` before media starts or when the bounded transmit queue cannot accept the input. It never waits indefinitely for a slow peer. RTP transmission is paced at 20 ms; missing output is filled with silence. The streaming windowed-sinc resampler retains filter history and fractional phase across input chunks and supports upsampling, downsampling, and non-integer ratios. G.722 uses 16-kHz PCM with its required 8-kHz RTP clock; received packet durations are converted to the 20-ms playout cadence.
 
-Call metrics expose transmitted/received packets and bytes, playout loss, duplicate/late packets, estimated jitter, queue duration, and underruns. RTT is currently `null`: RTCP reporting is not implemented yet. Metrics events are emitted once per second. Event handlers must return promptly and must not synchronously wait for protocol operations.
+Call metrics expose transmitted/received packets and bytes, playout loss, duplicate/late packets, estimated jitter, queue duration, and underruns. `Metrics.Control` contains RTCP datagram counters, rejected control packets, control transport errors, the peer's reported cumulative loss/fraction/jitter, and the last report time. These peer-reported values remain separate from local measurements.
+
+`RoundTripMilliseconds` becomes available when a valid peer report acknowledges one of this call's recent sender reports. It uses monotonic elapsed time minus the peer's processing delay; unrecognized report identifiers cannot create a measurement. This is the media-endpoint RTT, not telephone echo latency, audio-buffer delay, or AI response time. It remains `null` until enough report data is available. Metrics events are emitted once per second. Event handlers must return promptly and must not synchronously wait for protocol operations.
+
+Each call reserves an even RTP port and the adjacent odd RTCP port, advertises its control endpoint in SDP, and accepts the remote `a=rtcp` address/port or the standard RTP-port-plus-one fallback. Point-to-point compound SR/RR reports include SDES/CNAME; teardown sends a bounded best-effort compound BYE. `RtcpReportInterval` defaults to five seconds (configurable from one to sixty), with randomized timing and a shorter initial interval. An unavailable RTCP port or malformed control packet does not interrupt RTP audio. RTCP multiplexing is not negotiated.
 
 ## VoiceAssistant adapter
 
@@ -126,8 +132,8 @@ Create one adapter per call. It converts PCM16 to/from the VoiceAssistant base64
 
 - SIP over UDP, TCP, or TLS. TLS uses normal certificate/hostname validation and allows TLS 1.2/1.3.
 - Digest authentication: MD5 and SHA-256, including `-sess`, with `qop=auth` or legacy no-qop challenges.
-- G.711 PCMA/PCMU and G.722, RTP, bounded receive buffering, and 24-kHz PCM conversion.
-- Optional SDES-SRTP using `AES_CM_128_HMAC_SHA1_80`, authenticated packets and a replay window. SDES is accepted only with TLS signalling; encryption downgrade is rejected.
+- G.711 PCMA/PCMU and G.722, RTP/RTCP, bounded receive buffering, and 24-kHz PCM conversion.
+- Optional SDES-SRTP/SRTCP using `AES_CM_128_HMAC_SHA1_80`, authenticated packets and independent replay windows. Control traffic uses its own derived keys and packet index; it is never sent in plaintext for an encrypted call. SDES is accepted only with TLS signalling; encryption downgrade is rejected.
 - Credentials and SDP key material are not emitted in diagnostic events. Keep secrets out of source control and application logs.
 
 Configure encrypted media explicitly:
@@ -137,7 +143,7 @@ Transport = SipTransportProtocol.Tls,
 MediaSecurity = SipMediaSecurity.SdesRequired
 ```
 
-Currently unsupported: DTLS-SRTP, SRTCP, Opus, DNS NAPTR/SRV discovery, ICE/STUN/TURN, session timers, reliable provisional responses/PRACK, hold/re-INVITE, transfers, and forked-dialog handling. The endpoint targets direct PBX registration rather than implementing a SIP proxy or registrar. Plain RTP/SDES support does not imply WebRTC compatibility.
+Currently unsupported: DTLS-SRTP, RTCP multiplexing, Opus, DNS NAPTR/SRV discovery, ICE/STUN/TURN, session timers, reliable provisional responses/PRACK, hold/re-INVITE, transfers, and forked-dialog handling. The endpoint targets direct PBX registration rather than implementing a SIP proxy or registrar. Plain RTP/SDES support does not imply WebRTC compatibility.
 
 ## Try the console
 
@@ -171,6 +177,8 @@ dotnet pack src/Ai.Tlbx.VoiceAssistant.Sip -c Release -o artifacts
 ```
 
 The test runner requires no test framework and returns a nonzero exit code on failure. It covers framing, parser rejection, G.711 values, resampling continuity and anti-aliasing, RFC 3711 key-derivation vectors, SRTP tamper/replay rejection and rollover, registration/authentication, UDP retransmission, TCP stream fragmentation, contact selection, registration expiry/recovery, refresh/disconnect ordering, call setup/teardown, cancellation/acceptance races, late final responses, duplicate INVITEs, early-media backlog, silence suppression, PCM flow, G.722, and the VoiceAssistant adapter. TLS tests exchange SIP over real encrypted loopback connections and verify rejection of unknown certificate authorities and wrong hostnames, using an ephemeral test CA without changing machine trust stores. Builds and tests have been run on Windows and Debian Linux. A Windows/Linux CI template is provided in `.github/verify-workflow.template.yml`; enabling it requires moving it into `.github/workflows/verify.yml` with a GitHub credential authorized to write workflows. No PBX credentials or paid AI calls are needed.
+
+RTCP/SRTCP coverage includes independent libSRTP numeric encryption fixtures, signed cumulative loss and sequence rollover, NTP/report fields, monotonic RTT excluding remote processing delay, explicit SDP control endpoints, UDP port-pair release, actual encrypted and plaintext loopback exchanges, malformed-control rejection, and uninterrupted RTP when the remote RTCP port is closed. Only numeric reference data is used from [libSRTP's interoperability tests](https://github.com/cisco/libsrtp/blob/main/test/srtp_driver.c); the implementation is written against the RFCs.
 
 Implemented from protocol specifications: [SIP](https://www.rfc-editor.org/rfc/rfc3261), [transaction corrections](https://www.rfc-editor.org/rfc/rfc6026), [SDP offer/answer](https://www.rfc-editor.org/rfc/rfc3264), [RTP](https://www.rfc-editor.org/rfc/rfc3550), [SRTP](https://www.rfc-editor.org/rfc/rfc3711), and [SDES](https://www.rfc-editor.org/rfc/rfc4568).
 

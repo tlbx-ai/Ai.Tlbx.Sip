@@ -31,7 +31,11 @@ try
     void Attach(SipCall call)
     {
         call.StatusChanged += (_, status) => Console.WriteLine($"Call {call.Id}: {status.State} {status.EndReason}");
-        call.Audio.MetricsChanged += (_, m) => Console.WriteLine($"Call {call.Id}: codec={m.Codec} TX={m.TransmittedPackets} RX={m.ReceivedPackets} lost={m.LostPackets} jitter={m.JitterMilliseconds:F1}ms queue={m.QueuedAudio.TotalMilliseconds:F0}ms");
+        call.Audio.MetricsChanged += (_, m) =>
+        {
+            string rtt = m.RoundTripMilliseconds.HasValue ? m.RoundTripMilliseconds.Value.ToString("F1", System.Globalization.CultureInfo.InvariantCulture) + "ms" : "unknown";
+            Console.WriteLine($"Call {call.Id}: codec={m.Codec} TX={m.TransmittedPackets} RX={m.ReceivedPackets} lost={m.LostPackets} jitter={m.JitterMilliseconds:F1}ms queue={m.QueuedAudio.TotalMilliseconds:F0}ms rtt={rtt} RTCP={m.Control?.TransmittedPackets}/{m.Control?.ReceivedPackets}");
+        };
         if (args.Contains("--echo")) operations.Add(ObserveAsync(async () =>
         {
             await foreach (var frame in call.Audio.ReadFramesAsync(stop.Token))
