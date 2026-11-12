@@ -16,6 +16,7 @@ public sealed class SipClient : IAsyncDisposable
     private readonly SipClientConfig _config;
     private readonly TimeProvider _time;
     private readonly SemaphoreSlim _lifecycle = new(1, 1);
+    private readonly SemaphoreSlim _registration = new(1, 1);
     private readonly ConcurrentDictionary<string, SipCall> _calls = new();
     private readonly ConcurrentDictionary<string, (SipMessage Response, DateTimeOffset Expires)> _responses = new();
     private readonly DigestAuthentication _digest = new();
@@ -29,6 +30,7 @@ public sealed class SipClient : IAsyncDisposable
     private readonly string _registrationTag = NewId();
     private int _sequence = RandomNumberGenerator.GetInt32(1, 1000000);
     private bool _disposed;
+    private bool _disconnecting;
     private SipClientStatus _status;
     internal SipClient(SipClientConfig config, TimeProvider time)
     {
@@ -57,6 +59,7 @@ public sealed class SipClient : IAsyncDisposable
             if (_connection is null || _connection.IsCompleted)
             {
                 _stop?.Dispose(); _stop = new();
+                _disconnecting = false;
                 _firstConnection = new(TaskCreationOptions.RunContinuationsAsynchronously);
                 _connection = ConnectionLoopAsync(_stop.Token);
             }
@@ -79,6 +82,7 @@ public sealed class SipClient : IAsyncDisposable
                 await transport.OpenAsync(generation.Token);
                 receiver = ReceiveLoopAsync(transport, generation);
                 DateTimeOffset expires = await RegisterAsync(_config.RegistrationLifetimeSeconds, generation.Token);
+                if (Volatile.Read(ref _disconnecting)) await Task.Delay(Timeout.InfiniteTimeSpan, _time, generation.Token);
                 SetStatus(SipClientState.Connected, expires: expires);
                 previouslyConnected = true; _firstConnection.TrySetResult();
                 while (!generation.IsCancellationRequested)
@@ -86,8 +90,10 @@ public sealed class SipClient : IAsyncDisposable
                     TimeSpan untilRefresh = TimeSpan.FromTicks((expires - _time.GetUtcNow()).Ticks * 2 / 3);
                     var delay = untilRefresh < _config.KeepAliveInterval ? untilRefresh : _config.KeepAliveInterval;
                     await Task.Delay(delay > TimeSpan.Zero ? delay : TimeSpan.Zero, _time, generation.Token);
+                    if (Volatile.Read(ref _disconnecting)) await Task.Delay(Timeout.InfiniteTimeSpan, _time, generation.Token);
                     // Authenticated REGISTER refresh both checks credentials and keeps the incoming route alive.
                     expires = await RegisterAsync(_config.RegistrationLifetimeSeconds, generation.Token);
+                    if (Volatile.Read(ref _disconnecting)) await Task.Delay(Timeout.InfiniteTimeSpan, _time, generation.Token);
                     SetStatus(SipClientState.Connected, expires: expires);
                     foreach (var pair in _responses.Where(p => p.Value.Expires <= _time.GetUtcNow()).ToArray()) _responses.TryRemove(pair.Key, out _);
                 }
@@ -123,6 +129,16 @@ public sealed class SipClient : IAsyncDisposable
     }
     private async Task<DateTimeOffset> RegisterAsync(int expiry, CancellationToken cancellationToken)
     {
+        await _registration.WaitAsync(cancellationToken);
+        try
+        {
+            if (expiry > 0 && Volatile.Read(ref _disconnecting)) return Status.RegistrationExpiresAt ?? _time.GetUtcNow();
+            return await RegisterCoreAsync(expiry, cancellationToken);
+        }
+        finally { _registration.Release(); }
+    }
+    private async Task<DateTimeOffset> RegisterCoreAsync(int expiry, CancellationToken cancellationToken)
+    {
         var request = Request("REGISTER", $"sip:{_config.SipDomain}", _registrationCallId, _registrationTag);
         request.Add("Expires", expiry.ToString(System.Globalization.CultureInfo.InvariantCulture));
         var response = await RequestAuthenticatedAsync(request, null, cancellationToken);
@@ -133,7 +149,11 @@ public sealed class SipClient : IAsyncDisposable
             response = await RequestAuthenticatedAsync(request, null, cancellationToken); expiry = minimum;
         }
         EnsureSuccess(response);
-        string contactExpiry = SipMessage.Parameter(response.GetAll("Contact").FirstOrDefault(c => c.Contains(Uri.EscapeDataString(_config.User) + "@", StringComparison.Ordinal)) ?? "", "expires");
+        // A registrar can return several bindings for the same username, including
+        // expired contacts from an earlier socket. Match this binding's URI.
+        string requestedContact = SipMessage.UriFromHeader(request.Get("Contact")).Split(';')[0];
+        string contactExpiry = SipMessage.Parameter(response.GetAll("Contact").FirstOrDefault(c =>
+            SipMessage.UriFromHeader(c).Split(';')[0].Equals(requestedContact, StringComparison.OrdinalIgnoreCase)) ?? "", "expires");
         if (int.TryParse(contactExpiry.Length > 0 ? contactExpiry : response.Get("Expires"), out int granted)) expiry = granted;
         if (expiry <= 0 && request.Get("Expires") != "0") throw new InvalidDataException("Registrar granted an expired registration.");
         return _time.GetUtcNow().AddSeconds(Math.Min(expiry, 86400));
@@ -222,6 +242,7 @@ public sealed class SipClient : IAsyncDisposable
         try
         {
             if (_connection is null) return;
+            Volatile.Write(ref _disconnecting, true);
             SetStatus(SipClientState.Disconnecting);
             foreach (var call in Calls) try { await call.HangupAsync(cancellationToken); } catch (Exception error) { Report("hangup", error.Message); }
             if (_transport is not null)

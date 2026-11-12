@@ -4,6 +4,7 @@
     <AllowUnsafeBlocks>false</AllowUnsafeBlocks>
   </PropertyGroup>
   <ItemGroup>
+    <PackageReference Include="NAudio.Core" Version="3.3.0" />
     <InternalsVisibleTo Include="Ai.Tlbx.Sip.Tests" />
   </ItemGroup>
 </Project>

@@ -10,15 +10,15 @@ internal sealed record SdpSession(IPAddress Address, int Port, int PayloadType, 
     public static string Offer(IPAddress address, int port, byte[]? key, long sessionId)
     {
         string family = address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetworkV6 ? "IP6" : "IP4";
-        var text = new StringBuilder($"v=0\r\no=- {sessionId} {sessionId} IN {family} {address}\r\ns=Ai.Tlbx.Sip\r\nc=IN {family} {address}\r\nt=0 0\r\nm=audio {port} RTP/{(key is null ? "AVP" : "SAVP")} 8 0\r\na=rtpmap:8 PCMA/8000\r\na=rtpmap:0 PCMU/8000\r\na=ptime:20\r\na=sendrecv\r\n");
+        var text = new StringBuilder($"v=0\r\no=- {sessionId} {sessionId} IN {family} {address}\r\ns=Ai.Tlbx.Sip\r\nc=IN {family} {address}\r\nt=0 0\r\nm=audio {port} RTP/{(key is null ? "AVP" : "SAVP")} 9 8 0\r\na=rtpmap:9 G722/8000\r\na=rtpmap:8 PCMA/8000\r\na=rtpmap:0 PCMU/8000\r\na=ptime:20\r\na=sendrecv\r\n");
         if (key is not null) text.Append($"a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{Convert.ToBase64String(key)}\r\n");
         return text.ToString();
     }
     public static string Answer(IPAddress address, int port, byte[]? key, long sessionId, SdpSession remote)
     {
         string offer = Offer(address, port, key, sessionId);
-        offer = offer.Replace($" 8 0\r\n", $" {remote.PayloadType}\r\n");
-        offer = offer.Replace("a=rtpmap:8 PCMA/8000\r\na=rtpmap:0 PCMU/8000\r\n", $"a=rtpmap:{remote.PayloadType} {remote.Codec}/8000\r\n");
+        offer = offer.Replace(" 9 8 0\r\n", $" {remote.PayloadType}\r\n");
+        offer = offer.Replace("a=rtpmap:9 G722/8000\r\na=rtpmap:8 PCMA/8000\r\na=rtpmap:0 PCMU/8000\r\n", $"a=rtpmap:{remote.PayloadType} {remote.Codec}/8000\r\n");
         if (key is not null && remote.CryptoTag != 1) offer = offer.Replace("a=crypto:1 ", $"a=crypto:{remote.CryptoTag} ");
         return offer;
     }
@@ -54,7 +54,8 @@ internal sealed record SdpSession(IPAddress Address, int Port, int PayloadType, 
         foreach (string p in parts.Skip(3))
         {
             if (!int.TryParse(p, out int id) || id is < 0 or > 127) continue;
-            string mapping = attributes.FirstOrDefault(a => a.StartsWith($"rtpmap:{id} ", StringComparison.Ordinal))?.Split(' ', 2)[1] ?? (id == 8 ? "PCMA/8000" : id == 0 ? "PCMU/8000" : "");
+            string mapping = attributes.FirstOrDefault(a => a.StartsWith($"rtpmap:{id} ", StringComparison.Ordinal))?.Split(' ', 2)[1] ?? (id == 9 ? "G722/8000" : id == 8 ? "PCMA/8000" : id == 0 ? "PCMU/8000" : "");
+            if (mapping.Equals("G722/8000", StringComparison.OrdinalIgnoreCase) || mapping.Equals("G722/8000/1", StringComparison.OrdinalIgnoreCase)) { payload = id; codec = "G722"; break; }
             if (mapping.Equals("PCMA/8000", StringComparison.OrdinalIgnoreCase) || mapping.Equals("PCMA/8000/1", StringComparison.OrdinalIgnoreCase)) { payload = id; codec = "PCMA"; break; }
             if (mapping.Equals("PCMU/8000", StringComparison.OrdinalIgnoreCase) || mapping.Equals("PCMU/8000/1", StringComparison.OrdinalIgnoreCase)) { payload = id; codec = "PCMU"; break; }
         }
@@ -74,7 +75,7 @@ internal sealed record SdpSession(IPAddress Address, int Port, int PayloadType, 
             }
             if (masterKey is null) throw new NotSupportedException("No supported SRTP crypto attribute was offered.");
         }
-        return new(address, port, payload, codec, 8000, secure, masterKey, tag);
+        return new(address, port, payload, codec, codec == "G722" ? 16000 : 8000, secure, masterKey, tag);
     }
     public static byte[] NewMasterKey() => RandomNumberGenerator.GetBytes(30);
 }

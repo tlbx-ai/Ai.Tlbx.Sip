@@ -14,10 +14,15 @@ internal sealed class TestPbx : IAsyncDisposable
     private readonly Channel<SipMessage> _responses = Channel.CreateUnbounded<SipMessage>();
     private readonly Task _loop;
     private IPEndPoint? _client, _clientMedia;
+    private ushort _mediaSequence;
+    private uint _mediaTimestamp;
     public int Port => ((IPEndPoint)_sip.Client.LocalEndPoint!).Port;
     public int MediaPort => ((IPEndPoint)_rtp.Client.LocalEndPoint!).Port;
     public bool DropFirstRegister { get; init; }
     public bool RejectCredentials { get; init; }
+    public bool UseG722 { get; init; }
+    public int EarlyMediaPackets { get; init; }
+    public bool IncludeExpiredContact { get; init; }
     public int RegisterRequests { get; private set; }
     public int AuthenticatedRegistrations { get; private set; }
     public bool Unregistered { get; private set; }
@@ -46,6 +51,7 @@ internal sealed class TestPbx : IAsyncDisposable
                     if (valid && !RejectCredentials)
                     {
                         AuthenticatedRegistrations++; Unregistered = request.Get("Expires") == "0";
+                        if (IncludeExpiredContact) response.Add("Contact", "<sip:test-user@127.0.0.1:1>;expires=0");
                         response.Add("Expires", request.Get("Expires")); response.Add("Contact", request.Get("Contact") + ";expires=" + request.Get("Expires"));
                     }
                     await SendAsync(response);
@@ -54,9 +60,19 @@ internal sealed class TestPbx : IAsyncDisposable
                 {
                     var offer = SdpSession.Parse(request.Body, Ai.Tlbx.Sip.SipMediaSecurity.Unencrypted); _clientMedia = new(offer.Address, offer.Port);
                     await SendAsync(SipMessage.Response(request, 180, "Ringing", "remote-tag"));
+                    if (EarlyMediaPackets > 0)
+                    {
+                        var codec = new Ai.Tlbx.Sip.Media.AudioCodec(UseG722 ? "G722" : "PCMA");
+                        for (int i = 0; i < EarlyMediaPackets; i++)
+                        {
+                            var packet = Check.Rtp(++_mediaSequence, _mediaTimestamp, codec.Encode(new short[codec.SampleRate / 50]));
+                            packet[1] = UseG722 ? (byte)9 : (byte)8; _mediaTimestamp += 160;
+                            await _rtp.SendAsync(packet, _clientMedia);
+                        }
+                    }
                     var answer = SipMessage.Response(request, 200, "OK", "remote-tag");
                     answer.Add("Contact", $"<sip:remote@127.0.0.1:{Port}>"); answer.Add("Content-Type", "application/sdp");
-                    answer.Body = Encoding.UTF8.GetBytes(SdpSession.Offer(IPAddress.Loopback, MediaPort, null, 1)); await SendAsync(answer);
+                    answer.Body = Encoding.UTF8.GetBytes(TestSdp()); await SendAsync(answer);
                 }
                 else await SendAsync(SipMessage.Response(request, 200, "OK"));
             }
@@ -86,7 +102,7 @@ internal sealed class TestPbx : IAsyncDisposable
         invite.Add("From", "<sip:remote@example.test>;tag=remote-tag"); invite.Add("To", "<sip:test-user@example.test>");
         invite.Add("Call-ID", Guid.NewGuid().ToString("N")); invite.Add("CSeq", "1 INVITE");
         invite.Add("Contact", $"<sip:remote@127.0.0.1:{Port}>"); invite.Add("Content-Type", "application/sdp");
-        invite.Body = Encoding.UTF8.GetBytes(SdpSession.Offer(IPAddress.Loopback, MediaPort, null, 1)); await SendAsync(invite); return invite;
+        invite.Body = Encoding.UTF8.GetBytes(TestSdp()); await SendAsync(invite); return invite;
     }
     public Task AckAsync(SipMessage invite, SipMessage answer) => SendAsync(DialogRequest("ACK", 1, invite, answer));
     public Task ByeAsync(SipMessage invite, SipMessage answer) => SendAsync(DialogRequest("BYE", 2, invite, answer));
@@ -96,11 +112,22 @@ internal sealed class TestPbx : IAsyncDisposable
         request.Add("Via", $"SIP/2.0/UDP 127.0.0.1:{Port};branch=z9hG4bK{Guid.NewGuid():N}");
         request.Add("From", invite.Get("From")); request.Add("To", answer.Get("To")); request.Add("Call-ID", invite.Get("Call-ID")); request.Add("CSeq", sequence + " " + method); return request;
     }
-    public async Task SendAudioAsync()
+    public async Task SendAudioAsync(int packetMilliseconds = 20)
     {
-        for (ushort sequence = 1; sequence <= 8; sequence++)
-        { await _rtp.SendAsync(Check.Rtp(sequence, (uint)sequence * 160, Enumerable.Repeat((byte)0xD5, 160).ToArray()), _clientMedia!); await Task.Delay(20); }
+        var codec = new Ai.Tlbx.Sip.Media.AudioCodec(UseG722 ? "G722" : "PCMA");
+        for (int iPacket = 0; iPacket < 8; iPacket++)
+        {
+            short[] samples = Enumerable.Range(0, codec.SampleRate * packetMilliseconds / 1000)
+                .Select(i => (short)(8000 * Math.Sin(2 * Math.PI * 500 * i / codec.SampleRate))).ToArray();
+            var packet = Check.Rtp(++_mediaSequence, _mediaTimestamp, codec.Encode(samples));
+            _mediaTimestamp += (uint)(packetMilliseconds * 8);
+            packet[1] = UseG722 ? (byte)9 : (byte)8;
+            await _rtp.SendAsync(packet, _clientMedia!); await Task.Delay(packetMilliseconds);
+        }
     }
+    public void AdvanceMediaClock(int milliseconds) => _mediaTimestamp += (uint)(milliseconds * 8);
+    private string TestSdp() => UseG722 ? SdpSession.Offer(IPAddress.Loopback, MediaPort, null, 1)
+        : SdpSession.Offer(IPAddress.Loopback, MediaPort, null, 1).Replace(" 9 8 0\r\n", " 8 0\r\n").Replace("a=rtpmap:9 G722/8000\r\n", "");
     public async ValueTask DisposeAsync()
     { _stop.Cancel(); _sip.Dispose(); _rtp.Dispose(); await _loop; _responses.Writer.TryComplete(); _stop.Dispose(); }
 }

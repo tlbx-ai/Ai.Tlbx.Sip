@@ -1,0 +1,12 @@
+# Ai.Tlbx.Sip
+
+Build with .NET 11 / C# 15. Keep `Ai.Tlbx.Sip` independent of AI providers and audio-device APIs; the VoiceAssistant adapter is a separate project.
+
+Implement protocol behavior from the RFCs. Preserve native SIP status codes alongside application-level states. `Connected` means authenticated registration and incoming-call readiness, maintained by monitoring and renewal.
+
+Keep all audio, jitter and transaction buffers bounded. Preserve resampler/codec state across frames. Use platform cryptographic primitives and verify protocol-level encryption against independent vectors. Never disable TLS hostname or certificate validation.
+
+Run the executable protocol/media tests on Windows and Linux after relevant changes. Keep mock tests, real PBX registration, real call/audio acceptance, GitHub publication and NuGet publication distinct in reports and the README.
+Media regressions must cover early RTP before the final answer, bounded recovery from bursts, and speech resuming after silence suppression. RTP sequence numbers advance per transmitted packet, never per playout tick.
+
+Never commit credentials, live phone numbers, private PBX traces or audio recordings. Test configuration belongs outside the checkout. Public documentation is English. Update `Agents.md` and `CLAUDE.md` together.

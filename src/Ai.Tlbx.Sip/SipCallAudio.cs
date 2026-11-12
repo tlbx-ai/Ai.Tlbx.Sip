@@ -22,9 +22,11 @@ public sealed class SipCallAudio : IAsyncDisposable
     private readonly Channel<PcmAudioFrame> _received = Channel.CreateBounded<PcmAudioFrame>(new BoundedChannelOptions(100)
     { SingleReader = false, SingleWriter = true, FullMode = BoundedChannelFullMode.DropOldest });
     private readonly Queue<short> _outbound = new();
+    private readonly Queue<short> _decoded = new();
     private readonly SortedDictionary<long, (uint Timestamp, byte[] Payload)> _jitter = [];
     private readonly CancellationTokenSource _stop = new();
-    private readonly PcmResampler _rxResampler;
+    private PcmResampler? _rxResampler;
+    private AudioCodec? _codec;
     private PcmResampler? _txResampler;
     private int _txInputRate;
     private IPEndPoint? _remote;
@@ -45,17 +47,17 @@ public sealed class SipCallAudio : IAsyncDisposable
     {
         _config = config; _time = time; _failure = failure;
         _rtp = new UdpClient(new IPEndPoint(localAddress, 0));
-        _rxResampler = new(8000, config.AudioSampleRate);
         _masterKey = config.MediaSecurity == SipMediaSecurity.SdesRequired ? SdpSession.NewMasterKey() : null;
     }
     internal int Port => ((IPEndPoint)_rtp.Client.LocalEndPoint!).Port;
     internal byte[]? MasterKey => _masterKey;
     public int SampleRate => _config.AudioSampleRate;
-    public TimeSpan QueuedAudio { get { lock (_gate) return TimeSpan.FromSeconds(_outbound.Count / 8000.0); } }
+    private int CodecSampleRate => _codec?.SampleRate ?? 8000;
+    public TimeSpan QueuedAudio { get { lock (_gate) return TimeSpan.FromSeconds((double)_outbound.Count / CodecSampleRate); } }
     public SipMediaMetrics Metrics
     {
         get { lock (_gate) return new(_txPackets, _rxPackets, _txBytes, _rxBytes, _lost, _duplicate, _late,
-            _jitterSamples / 8.0, null, TimeSpan.FromSeconds(_outbound.Count / 8000.0), _underruns, _session?.Codec); }
+            _jitterSamples / 8.0, null, TimeSpan.FromSeconds((double)_outbound.Count / CodecSampleRate), _underruns, _session?.Codec); }
     }
     public event EventHandler<SipMediaMetrics>? MetricsChanged;
     public IAsyncEnumerable<PcmAudioFrame> ReadFramesAsync(CancellationToken cancellationToken = default) => _received.Reader.ReadAllAsync(cancellationToken);
@@ -65,15 +67,14 @@ public sealed class SipCallAudio : IAsyncDisposable
         if (sampleRate is < 8000 or > 96000) throw new ArgumentOutOfRangeException(nameof(sampleRate));
         lock (_gate)
         {
-            ObjectDisposedException.ThrowIf(_disposed, this);
-            if (_stop.IsCancellationRequested) return false;
-            int estimate = (int)Math.Ceiling(samples.Length * 8000.0 / sampleRate) + 64;
-            if (_outbound.Count + estimate > _config.MaxQueuedAudio.TotalSeconds * 8000) return false;
+            if (_disposed || _stop.IsCancellationRequested || !_started) return false;
+            int estimate = (int)Math.Ceiling((double)samples.Length * CodecSampleRate / sampleRate) + 128;
+            if (_outbound.Count + estimate > _config.MaxQueuedAudio.TotalSeconds * CodecSampleRate) return false;
             if (_txResampler is null || _txInputRate != sampleRate)
             {
                 if (_txResampler is not null)
                     foreach (short s in _txResampler.Process([], endOfStream: true)) _outbound.Enqueue(s);
-                _txResampler = new(sampleRate, 8000); _txInputRate = sampleRate;
+                _txResampler = new(sampleRate, CodecSampleRate); _txInputRate = sampleRate;
             }
             foreach (short s in _txResampler.Process(samples)) _outbound.Enqueue(s);
             return true;
@@ -107,6 +108,12 @@ public sealed class SipCallAudio : IAsyncDisposable
         {
             if (_started) throw new InvalidOperationException("Call media already started.");
             _started = true; _session = session; _remote = new(session.Address, session.Port);
+            _codec = new(session.Codec); _rxResampler = new(session.SampleRate, _config.AudioSampleRate);
+            // A PBX can send ringback/early media before the final answer. Those
+            // datagrams must not become seconds of stale audio at establishment.
+            byte[] discard = new byte[4096];
+            for (int i = 0; i < 512 && _rtp.Client.Available > 0; i++)
+            { _rtp.Client.Receive(discard); _late++; }
             if (session.Secure) { _txCrypto = new(_masterKey!); _rxCrypto = new(session.MasterKey!); }
             _tasks = [GuardAsync(ReceiveAsync), GuardAsync(SendAsync), GuardAsync(PlayoutAsync), GuardAsync(MetricsAsync)];
         }
@@ -123,15 +130,22 @@ public sealed class SipCallAudio : IAsyncDisposable
         using var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(20), _time);
         while (await timer.WaitForNextTickAsync(cancellationToken))
         {
-            byte[] packet = new byte[172];
+            byte[] packet;
+            lock (_gate)
+            {
+                int count = CodecSampleRate / 50;
+                if (_outbound.Count < count) _underruns++;
+                var samples = new short[count];
+                for (int i = 0; i < count; i++) samples[i] = _outbound.Count > 0 ? _outbound.Dequeue() : (short)0;
+                var encoded = _codec!.Encode(samples);
+                packet = new byte[12 + encoded.Length]; encoded.CopyTo(packet, 12);
+            }
             packet[0] = 0x80; packet[1] = (byte)_session!.PayloadType;
             BinaryPrimitives.WriteUInt16BigEndian(packet.AsSpan(2), _sequence++);
             BinaryPrimitives.WriteUInt32BigEndian(packet.AsSpan(4), _timestamp); _timestamp += 160;
             BinaryPrimitives.WriteUInt32BigEndian(packet.AsSpan(8), _ssrc);
             lock (_gate)
             {
-                if (_outbound.Count < 160) _underruns++;
-                for (int i = 12; i < packet.Length; i++) packet[i] = G711.Encode(_outbound.Count > 0 ? _outbound.Dequeue() : (short)0, _session.Codec == "PCMA");
                 if (_txCrypto is not null) packet = _txCrypto.Protect(packet, 12);
             }
             await _rtp.SendAsync(packet, _remote!, cancellationToken);
@@ -181,7 +195,13 @@ public sealed class SipCallAudio : IAsyncDisposable
                 else if (_highestSequence >= 0 && _highestSequence - extended > 32768) extended += 65536;
                 if (_playing && extended < _playSequence) { _late++; continue; }
                 if (_jitter.ContainsKey(extended)) { _duplicate++; continue; }
-                if (_jitter.Count >= 100) { _late++; continue; }
+                if (_jitter.Count >= 12)
+                {
+                    // Recover toward the live edge after scheduling stalls/bursts.
+                    // Dropping newest packets would preserve stale speech and add delay.
+                    while (_jitter.Count > 3) { _jitter.Remove(_jitter.First().Key); _late++; }
+                    if (_playing) { _playSequence = _jitter.First().Key; _decoded.Clear(); }
+                }
                 uint timestamp = BinaryPrimitives.ReadUInt32BigEndian(packet.AsSpan(4));
                 long arrival = (long)(_time.GetTimestamp() * (8000.0 / _time.TimestampFrequency));
                 long transit = arrival - timestamp;
@@ -201,9 +221,26 @@ public sealed class SipCallAudio : IAsyncDisposable
             lock (_gate)
             {
                 if (!_playing) { if (_jitter.Count < 3) continue; _playing = true; _playSequence = _jitter.First().Key; }
-                if (_jitter.Remove(_playSequence++, out var frame)) samples = frame.Payload.Select(b => G711.Decode(b, _session!.Codec == "PCMA")).ToArray();
-                else { _lost++; samples = new short[160]; }
-                var resampled = _rxResampler.Process(samples);
+                int frameSamples = CodecSampleRate / 50;
+                while (_decoded.Count < frameSamples)
+                {
+                    if (_jitter.Remove(_playSequence, out var frame))
+                    {
+                        _playSequence++;
+                        foreach (short sample in _codec!.Decode(frame.Payload)) _decoded.Enqueue(sample);
+                    }
+                    else
+                    {
+                        // Empty receive queues can mean silence suppression. RTP
+                        // sequence numbers advance per transmitted packet, not per
+                        // playout tick. Only a later packet proves a sequence gap.
+                        if (_jitter.Count > 0 && _jitter.First().Key > _playSequence) { _lost++; _playSequence++; }
+                        while (_decoded.Count < frameSamples) _decoded.Enqueue(0);
+                    }
+                }
+                samples = new short[frameSamples];
+                for (int i = 0; i < frameSamples; i++) samples[i] = _decoded.Dequeue();
+                var resampled = _rxResampler!.Process(samples);
                 _received.Writer.TryWrite(new(resampled, SampleRate, _samplePosition)); _samplePosition += resampled.Length;
             }
         }

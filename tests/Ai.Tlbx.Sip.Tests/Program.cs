@@ -76,7 +76,7 @@ var cases = new (string Name, Func<Task> Run)[]
     {
         var sdp = Encoding.UTF8.GetBytes(SdpSession.Offer(IPAddress.Loopback, 4000, null, 1));
         var parsed = SdpSession.Parse(sdp, SipMediaSecurity.Unencrypted);
-        Check.That(parsed.Codec == "PCMA" && parsed.SampleRate == 8000 && parsed.Port == 4000);
+        Check.That(parsed.Codec == "G722" && parsed.SampleRate == 16000 && parsed.Port == 4000);
         Check.Throws<InvalidDataException>(() => SdpSession.Parse(sdp, SipMediaSecurity.SdesRequired));
         Check.That(SipCallAudio.RtpHeaderLength([0x80, 8]) == -1);
         return Task.CompletedTask;
@@ -97,6 +97,23 @@ var cases = new (string Name, Func<Task> Run)[]
         Check.That(client.Status.State == SipClientState.Connected && pbx.RegisterRequests >= 3 && pbx.AuthenticatedRegistrations > 0);
         await client.DisconnectAsync();
         Check.That(client.Status.State == SipClientState.Disconnected && pbx.Unregistered);
+    }),
+    ("Registration selects its own contact and disconnect does not renew", async () =>
+    {
+        await using var pbx = new TestPbx { IncludeExpiredContact = true }; await using var manager = new SipClientManager();
+        var client = manager.CreateClient(Check.Config(pbx.Port, keepAlive: TimeSpan.FromMilliseconds(60)));
+        await client.ConnectAsync(); await Task.Delay(180);
+        Check.That(client.Status.State == SipClientState.Connected && pbx.AuthenticatedRegistrations >= 2);
+        await client.DisconnectAsync(); int registrations = pbx.AuthenticatedRegistrations;
+        await Task.Delay(150);
+        Check.That(pbx.Unregistered && pbx.AuthenticatedRegistrations == registrations);
+    }),
+    ("TCP registration survives fragmented stream messages", async () =>
+    {
+        await using var pbx = new TcpTestPbx(); await using var manager = new SipClientManager();
+        var client = manager.CreateClient(Check.Config(pbx.Port, SipTransportProtocol.Tcp));
+        await client.ConnectAsync(); Check.That(client.Status.State == SipClientState.Connected);
+        await client.DisconnectAsync(); Check.That(pbx.Unregistered);
     }),
     ("Wrong credentials cannot establish Connected", async () =>
     {
@@ -123,7 +140,48 @@ var cases = new (string Name, Func<Task> Run)[]
         Check.That(call.Metrics.ReceivedPackets >= 3 && call.Metrics.TransmittedPackets >= 3);
         await adapter.StopRecordingAudio();
         await call.HangupAsync(); Check.That(call.Status.EndReason == SipCallEndReason.LocalHangup && client.Calls.Count == 0);
+        Check.That(!call.Audio.TryWrite(new short[480], 24000), "A closing audio producer must safely reject a trailing frame.");
         await client.DisconnectAsync();
+    }),
+    ("Early RTP is discarded and speech resumes after silence suppression", async () =>
+    {
+        await using var pbx = new TestPbx { EarlyMediaPackets = 150 }; await using var manager = new SipClientManager();
+        var client = manager.CreateClient(Check.Config(pbx.Port)); await client.ConnectAsync();
+        var call = client.CreateCall("123"); await call.StartAsync();
+        Check.That(call.Metrics.ReceivedPackets == 0 && call.Metrics.LatePackets > 0, "Early media must not enter established playout.");
+        var first = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var resumed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        int phase = 0;
+        var reader = Task.Run(async () =>
+        {
+            await foreach (var frame in call.Audio.ReadFramesAsync())
+                if (frame.Samples.ToArray().Any(s => Math.Abs((int)s) > 500))
+                { if (Volatile.Read(ref phase) == 0) first.TrySetResult(); else resumed.TrySetResult(); }
+        });
+        await pbx.SendAudioAsync(); await first.Task.WaitAsync(TimeSpan.FromSeconds(3));
+        await Task.Delay(400); Check.That(call.Metrics.LostPackets == 0, "Silence is not packet loss.");
+        Volatile.Write(ref phase, 1); pbx.AdvanceMediaClock(400);
+        await pbx.SendAudioAsync(); await resumed.Task.WaitAsync(TimeSpan.FromSeconds(3));
+        Check.That(call.Metrics.ReceivedPackets == 16, "Packets after DTX must still be accepted.");
+        await call.HangupAsync(); await reader; await client.DisconnectAsync();
+    }),
+    ("Managed G.722 wideband and variable packet duration", async () =>
+    {
+        foreach (int milliseconds in new[] { 10, 30 })
+        {
+            await using var pbx = new TestPbx { UseG722 = true }; await using var manager = new SipClientManager();
+            var client = manager.CreateClient(Check.Config(pbx.Port)); await client.ConnectAsync();
+            var call = client.CreateCall("123"); await call.StartAsync();
+            Check.That(call.Metrics.Codec == "G722");
+            var reading = Task.Run(async () =>
+            {
+                await foreach (var frame in call.Audio.ReadFramesAsync())
+                    if (frame.Samples.Length > 0) { Check.That(frame.SampleRate == 24000 && frame.Samples.Length <= 480); return; }
+            });
+            Check.That(call.Audio.TryWrite(new short[2400], 24000));
+            await pbx.SendAudioAsync(milliseconds); await reading.WaitAsync(TimeSpan.FromSeconds(3));
+            await call.HangupAsync(); await client.DisconnectAsync();
+        }
     }),
     ("Incoming call event, duplicate INVITE, answer, ACK and remote BYE", async () =>
     {
@@ -158,11 +216,12 @@ internal static class Check
     public static void That(bool condition, string? message = null) { if (!condition) throw new Exception(message ?? "Assertion failed."); }
     public static void Throws<T>(Action action) where T : Exception
     { try { action(); } catch (T) { return; } throw new Exception($"Expected {typeof(T).Name}"); }
-    public static SipClientConfig Config(int port) => new()
+    public static SipClientConfig Config(int port, SipTransportProtocol transport = SipTransportProtocol.Udp, TimeSpan? keepAlive = null) => new()
     {
-        Id = "test", Registrar = "127.0.0.1", Port = port, User = "test-user", Domain = "example.test",
+        Id = "test", Registrar = "127.0.0.1", Port = port, User = "test-user", Domain = "example.test", Transport = transport,
         Credentials = new() { Username = "test-user", Password = "test-password" }, LocalAddress = IPAddress.Loopback,
-        AutoReconnect = false, TransactionTimeout = TimeSpan.FromSeconds(2), InitialRetransmitInterval = TimeSpan.FromMilliseconds(50)
+        AutoReconnect = false, TransactionTimeout = TimeSpan.FromSeconds(2), InitialRetransmitInterval = TimeSpan.FromMilliseconds(50),
+        KeepAliveInterval = keepAlive ?? TimeSpan.FromSeconds(25)
     };
     public static byte[] Rtp(ushort sequence, uint timestamp, byte[] payload)
     {

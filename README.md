@@ -4,7 +4,7 @@ Managed SIP clients with observable connection state, call objects, and bidirect
 
 The SIP library handles telephony. Applications decide whether to connect a call to an audio device, a recorder, or an AI voice assistant. Multiple independently authenticated SIP identities can run in the same process.
 
-> **Early development.** The current implementation passes local protocol and media tests against a simulated PBX. Real FRITZ!Box and easybell interoperability, security review, and broader failure-mode coverage are still pending. Do not treat this initial implementation as production-ready.
+> **Early development.** Protocol and media tests pass on Windows and Linux against a simulated PBX. Real FRITZ!Box testing covers registration, incoming and outgoing calls, bidirectional echo audio, remote hangup, and clean unregistration. An outgoing G.722 acceptance call sustained approximately 2,800 packets in each direction without detected sequence loss; the listener confirmed continuous, clear audio with a stable perceived delay. The first incoming test had approximately one second of perceived round-trip delay; latency has not yet been attributed to individual components. easybell interoperability, security review, and broader failure-mode coverage are still pending. Do not treat this initial implementation as production-ready.
 
 ## Projects
 
@@ -14,7 +14,7 @@ The SIP library handles telephony. Applications decide whether to connect a call
 | `Ai.Tlbx.VoiceAssistant.Sip` | A per-call `IAudioHardwareAccess` adapter for [Ai.Tlbx.VoiceAssistant](https://github.com/tlbx-ai/Ai.Tlbx.VoiceAssistant). |
 | `SipConsole` | Explicitly controlled registration, incoming/outgoing calls, and optional audio echo. |
 
-Uses .NET 11 and C# 15. The current SIP core has no third-party package dependencies. The VoiceAssistant adapter references the published VoiceAssistant package. No native SIP/media binary, FFmpeg, ALSA, or Windows audio API is required by these libraries.
+Uses .NET 11 and C# 15. The SIP core references the cross-platform MIT-licensed `NAudio.Core` package for its managed G.722 codec. The VoiceAssistant adapter references the published VoiceAssistant package. No native SIP/media binary, FFmpeg, ALSA, or Windows audio API is required by these libraries.
 
 ## Create and connect a client
 
@@ -97,7 +97,7 @@ bool drained = await call.Audio.WaitForDrainAsync(TimeSpan.FromSeconds(5));
 
 `ReadFramesAsync` is a consuming stream: multiple readers distribute frames rather than broadcast them. Use one reader and fan out in your application if needed. The receive queue discards its oldest frames when its bounded capacity is exceeded.
 
-`TryWrite` copies/resamples accepted samples and returns `false` when the bounded transmit queue cannot accept the input. It never waits indefinitely for a slow peer. RTP transmission is paced at 20 ms; missing output is filled with silence. The streaming windowed-sinc resampler retains filter history and fractional phase across input chunks and supports upsampling, downsampling, and non-integer ratios.
+`TryWrite` copies/resamples accepted samples and returns `false` before media starts or when the bounded transmit queue cannot accept the input. It never waits indefinitely for a slow peer. RTP transmission is paced at 20 ms; missing output is filled with silence. The streaming windowed-sinc resampler retains filter history and fractional phase across input chunks and supports upsampling, downsampling, and non-integer ratios. G.722 uses 16-kHz PCM with its required 8-kHz RTP clock; received packet durations are converted to the 20-ms playout cadence.
 
 Call metrics expose transmitted/received packets and bytes, playout loss, duplicate/late packets, estimated jitter, queue duration, and underruns. RTT is currently `null`: RTCP reporting is not implemented yet. Metrics events are emitted once per second. Event handlers must return promptly and must not synchronously wait for protocol operations.
 
@@ -118,7 +118,7 @@ Create one adapter per call. It converts PCM16 to/from the VoiceAssistant base64
 
 - SIP over UDP, TCP, or TLS. TLS uses normal certificate/hostname validation and allows TLS 1.2/1.3.
 - Digest authentication: MD5 and SHA-256, including `-sess`, with `qop=auth` or legacy no-qop challenges.
-- G.711 PCMA/PCMU, RTP, bounded receive buffering, and 24-kHz PCM conversion.
+- G.711 PCMA/PCMU and G.722, RTP, bounded receive buffering, and 24-kHz PCM conversion.
 - Optional SDES-SRTP using `AES_CM_128_HMAC_SHA1_80`, authenticated packets and a replay window. SDES is accepted only with TLS signalling; encryption downgrade is rejected.
 - Credentials and SDP key material are not emitted in diagnostic events. Keep secrets out of source control and application logs.
 
@@ -129,7 +129,7 @@ Transport = SipTransportProtocol.Tls,
 MediaSecurity = SipMediaSecurity.SdesRequired
 ```
 
-Currently unsupported: DTLS-SRTP, SRTCP, G.722/Opus, DNS NAPTR/SRV discovery, ICE/STUN/TURN, session timers, reliable provisional responses/PRACK, hold/re-INVITE, transfers, and forked-dialog handling. The endpoint targets direct PBX registration rather than implementing a SIP proxy or registrar. Plain RTP/SDES support does not imply WebRTC compatibility.
+Currently unsupported: DTLS-SRTP, SRTCP, Opus, DNS NAPTR/SRV discovery, ICE/STUN/TURN, session timers, reliable provisional responses/PRACK, hold/re-INVITE, transfers, and forked-dialog handling. The endpoint targets direct PBX registration rather than implementing a SIP proxy or registrar. Plain RTP/SDES support does not imply WebRTC compatibility.
 
 ## Try the console
 
@@ -145,7 +145,9 @@ dotnet run --project samples/SipConsole
 
 Commands: `list`, `call <number>`, `answer <call-id>`, `hangup <call-id>`, `quit`.
 
-Optional flags: `--probe` registers then disconnects; `--echo` echoes received audio; `--auto-answer` explicitly enables answering incoming calls; `--srtp` requires SDES-SRTP. Set `SIP_TRANSPORT=Tls` for TLS. No outbound call is made automatically.
+Optional flags: `--probe` registers then disconnects; `--echo` echoes received audio; `--auto-answer` explicitly enables answering incoming calls; `--listen-seconds 300` listens for a bounded interval without console input; `--dial <destination>` explicitly starts an outgoing call after registration; `--srtp` requires SDES-SRTP. Set `SIP_TRANSPORT=Tls` for TLS. Outgoing calls require an explicit `call` command or `--dial` argument.
+
+Alternatively, pass `--config /path/to/client.secrets.json`. It accepts the `SipClientConfig` JSON properties, with enum names such as `"Transport": "Udp"`. Keep credential files outside the checkout. Never commit real configuration or credentials.
 
 FRITZ!Box: create an IP telephone in the router's telephony settings and use its dedicated credentials. Start on the same LAN. See [FRITZ!Box setup](https://fritz.com/apps/knowledge-base/FRITZ-Box-4050/42_ip-telefon-an-fritz-box-anmelden-und-einrichten).
 
@@ -160,7 +162,7 @@ dotnet pack src/Ai.Tlbx.Sip -c Release -o artifacts
 dotnet pack src/Ai.Tlbx.VoiceAssistant.Sip -c Release -o artifacts
 ```
 
-The dependency-free test runner returns a nonzero exit code on failure. It covers framing, parser rejection, G.711 values, resampling continuity and anti-aliasing, RFC 3711 key-derivation vectors, SRTP tamper/replay rejection and rollover, registration/authentication, UDP retransmission, call setup/teardown, duplicate INVITEs, PCM flow, and the VoiceAssistant adapter. Windows builds and tests have been run locally. A Windows/Linux CI template is provided in `.github/verify-workflow.template.yml`; enabling it requires moving it into `.github/workflows/verify.yml` with a GitHub credential authorized to write workflows. Linux execution is not yet verified. No PBX credentials or paid AI calls are needed.
+The test runner requires no test framework and returns a nonzero exit code on failure. It covers framing, parser rejection, G.711 values, resampling continuity and anti-aliasing, RFC 3711 key-derivation vectors, SRTP tamper/replay rejection and rollover, registration/authentication, UDP retransmission, TCP stream fragmentation, contact selection, refresh/disconnect ordering, call setup/teardown, duplicate INVITEs, early-media backlog, silence suppression, PCM flow, G.722, and the VoiceAssistant adapter. Builds and tests have been run on Windows and Debian Linux. A Windows/Linux CI template is provided in `.github/verify-workflow.template.yml`; enabling it requires moving it into `.github/workflows/verify.yml` with a GitHub credential authorized to write workflows. No PBX credentials or paid AI calls are needed.
 
 Implemented from protocol specifications: [SIP](https://www.rfc-editor.org/rfc/rfc3261), [transaction corrections](https://www.rfc-editor.org/rfc/rfc6026), [SDP offer/answer](https://www.rfc-editor.org/rfc/rfc3264), [RTP](https://www.rfc-editor.org/rfc/rfc3550), [SRTP](https://www.rfc-editor.org/rfc/rfc3711), and [SDES](https://www.rfc-editor.org/rfc/rfc4568).
 

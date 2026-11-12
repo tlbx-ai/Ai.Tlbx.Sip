@@ -1,4 +1,6 @@
 using System.Collections.Concurrent;
+using System.Text.Json;
+using System.Text.Json.Serialization;
 using Ai.Tlbx.Sip;
 
 static string Required(string name) => Environment.GetEnvironmentVariable(name) is { Length: > 0 } value ? value : throw new ArgumentException($"Set {name} before starting the sample.");
@@ -7,7 +9,12 @@ Console.CancelKeyPress += (_, e) => { e.Cancel = true; stop.Cancel(); };
 try
 {
     var transport = Enum.Parse<SipTransportProtocol>(Environment.GetEnvironmentVariable("SIP_TRANSPORT") ?? "Udp", ignoreCase: true);
-    var config = new SipClientConfig
+    int configIndex = Array.IndexOf(args, "--config");
+    var config = configIndex >= 0
+        ? JsonSerializer.Deserialize<SipClientConfig>(await File.ReadAllTextAsync(args[configIndex + 1], stop.Token),
+            new JsonSerializerOptions { PropertyNameCaseInsensitive = true, Converters = { new JsonStringEnumConverter() } })
+            ?? throw new ArgumentException("Configuration is empty.")
+        : new SipClientConfig
     {
         Id = "console", Registrar = Required("SIP_REGISTRAR"), User = Required("SIP_USER"),
         Domain = Environment.GetEnvironmentVariable("SIP_DOMAIN"),
@@ -24,11 +31,15 @@ try
     void Attach(SipCall call)
     {
         call.StatusChanged += (_, status) => Console.WriteLine($"Call {call.Id}: {status.State} {status.EndReason}");
-        call.Audio.MetricsChanged += (_, m) => Console.WriteLine($"Call {call.Id}: TX={m.TransmittedPackets} RX={m.ReceivedPackets} lost={m.LostPackets} jitter={m.JitterMilliseconds:F1}ms queue={m.QueuedAudio.TotalMilliseconds:F0}ms");
+        call.Audio.MetricsChanged += (_, m) => Console.WriteLine($"Call {call.Id}: codec={m.Codec} TX={m.TransmittedPackets} RX={m.ReceivedPackets} lost={m.LostPackets} jitter={m.JitterMilliseconds:F1}ms queue={m.QueuedAudio.TotalMilliseconds:F0}ms");
         if (args.Contains("--echo")) operations.Add(ObserveAsync(async () =>
         {
             await foreach (var frame in call.Audio.ReadFramesAsync(stop.Token))
-                if (!call.Audio.TryWrite(frame.Samples.Span, frame.SampleRate)) Console.WriteLine("Echo transmit queue full.");
+            {
+                if (call.Status.State == SipCallState.Ended) break;
+                if (!call.Audio.TryWrite(frame.Samples.Span, frame.SampleRate) && call.Status.State != SipCallState.Ended)
+                    Console.WriteLine("Echo transmit queue full.");
+            }
         }));
     }
     client.StatusChanged += (_, status) => Console.WriteLine($"Client: {status.State} {status.Error}");
@@ -39,7 +50,22 @@ try
         if (args.Contains("--auto-answer")) operations.Add(ObserveAsync(() => call.AnswerAsync(stop.Token)));
     };
     await client.ConnectAsync(stop.Token);
-    if (!args.Contains("--probe"))
+    int dialIndex = Array.IndexOf(args, "--dial");
+    if (dialIndex >= 0)
+    {
+        var outgoing = client.CreateCall(args[dialIndex + 1]);
+        Attach(outgoing);
+        operations.Add(ObserveAsync(() => outgoing.StartAsync(stop.Token)));
+    }
+    int listenIndex = Array.IndexOf(args, "--listen-seconds");
+    if (listenIndex >= 0)
+    {
+        int seconds = int.Parse(args[listenIndex + 1], System.Globalization.CultureInfo.InvariantCulture);
+        if (seconds is < 1 or > 3600) throw new ArgumentOutOfRangeException(nameof(seconds));
+        Console.WriteLine($"Listening for {seconds} seconds.");
+        await Task.Delay(TimeSpan.FromSeconds(seconds), stop.Token);
+    }
+    else if (!args.Contains("--probe"))
     {
         Console.WriteLine("Commands: call <number>, answer <id>, hangup <id>, list, quit. No outgoing call is made automatically.");
         while (!stop.IsCancellationRequested)
