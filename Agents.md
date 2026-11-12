@@ -11,5 +11,6 @@ Media regressions must cover early RTP before the final answer, bounded recovery
 AI playback regressions must burst more audio than the SIP transmit queue can hold and verify every section in order in received RTP. A short tone or nonzero packet count does not prove a complete response. Interruption and drain checks must include adapter and SIP queues.
 Call cancellation must complete the remote protocol cleanup, including a racing answer and repeated final responses. A completed readiness task from an earlier connection must never satisfy ConnectAsync while reconnecting or after registration expiry.
 Hangup waits must terminate when answer/ACK processing times out or the call ends. Caller cancellation must not abandon call-owned wire cleanup, and teardown must prevent a later Established transition.
+Call setup checks must cover native invalid-destination replies and progress-only deadlines. Timeout cleanup must ACK the final non-2xx INVITE response while preserving Timeout as the public outcome; demo teardown must retain the original call error.
 
 Never commit credentials, live phone numbers, private PBX traces or audio recordings. Test configuration belongs outside the checkout. Public documentation is English. Update `Agents.md` and `CLAUDE.md` together.

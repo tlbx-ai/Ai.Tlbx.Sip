@@ -178,7 +178,7 @@ public sealed class SipClient : IAsyncDisposable
         request.Add("From", $"<sip:{Uri.EscapeDataString(_config.User)}@{_config.SipDomain}>;tag={tag}");
         request.Add("To", to ?? $"<sip:{Uri.EscapeDataString(_config.User)}@{_config.SipDomain}>");
         request.Add("Call-ID", callId); request.Add("CSeq", $"{sequence ?? NextSequence()} {method}");
-        request.Add("Contact", Contact); request.Add("User-Agent", "Ai.Tlbx.Sip/0.1");
+        request.Add("Contact", Contact); request.Add("User-Agent", "Ai.Tlbx.Sip/1.0");
         return request;
     }
     internal int NextSequence() => Interlocked.Increment(ref _sequence);
@@ -213,14 +213,8 @@ public sealed class SipClient : IAsyncDisposable
         throw new InvalidOperationException();
     }
     internal Task SendAsync(SipMessage message, CancellationToken cancellationToken = default) => Transport.SendAsync(message, cancellationToken);
-    private async Task SendFailureAckAsync(SipMessage invite, SipMessage response, CancellationToken cancellationToken)
-    {
-        var ack = new SipMessage { StartLine = $"ACK {invite.RequestUri} SIP/2.0" };
-        foreach (string name in new[] { "Via", "From", "Call-ID", "Max-Forwards", "Route" })
-            foreach (string value in invite.GetAll(name)) ack.Add(name, value);
-        ack.Add("To", response.Get("To")); ack.Add("CSeq", invite.CSeqNumber + " ACK");
-        await SendAsync(ack, cancellationToken);
-    }
+    private Task SendFailureAckAsync(SipMessage invite, SipMessage response, CancellationToken cancellationToken) =>
+        SendAsync(SipMessage.FailureAck(invite, response), cancellationToken);
     internal async Task ReplyAsync(SipMessage request, SipMessage response, CancellationToken cancellationToken = default)
     {
         TrimCache(_responses, 1024, x => x.Expires);

@@ -233,14 +233,51 @@ var cases = new (string Name, Func<Task> Run)[]
         Check.That(!call.Audio.TryWrite(new short[480], 24000), "A closing audio producer must safely reject a trailing frame.");
         await client.DisconnectAsync();
     }),
-    ("Rejected calls preserve SIP status rather than becoming cancellations", async () =>
+    ("Minimum 20-ms transmit queue accepts and drains a complete resampled frame", async () =>
     {
-        await using var pbx = new TestPbx { RejectCallWith = 486 }; await using var manager = new SipClientManager();
-        var client = manager.CreateClient(Check.Config(pbx.Port)); await client.ConnectAsync(); var call = client.CreateCall("123");
-        try { await call.StartAsync(); throw new Exception("Expected SIP rejection."); }
-        catch (SipException e) { Check.That(e.StatusCode == 486); }
-        Check.That(call.Status.EndReason == SipCallEndReason.Busy);
-        await client.DisconnectAsync();
+        await using var pbx = new TestPbx(); await using var manager = new SipClientManager();
+        var client = manager.CreateClient(Check.Config(pbx.Port, maxQueuedAudio: TimeSpan.FromMilliseconds(20)));
+        await client.ConnectAsync(); var call = client.CreateCall("123"); await call.StartAsync();
+        await using var adapter = new SipAudioHardwareAccess(call);
+        Check.That(adapter.PlayAudio(Convert.ToBase64String(new byte[960]), 24000));
+        Check.That(await adapter.WaitForPlaybackDrainAsync(TimeSpan.FromSeconds(1)), "Minimum queue permanently rejected sender slices.");
+        Check.That(call.Metrics.TransmittedPackets > 0);
+        await call.HangupAsync(); await client.DisconnectAsync();
+    }),
+    ("Invalid destinations and busy replies preserve native SIP errors and ACK cleanup", async () =>
+    {
+        foreach (int code in new[] { 404, 484, 604, 486 })
+        {
+            await using var pbx = new TestPbx { RejectCallWith = code }; await using var manager = new SipClientManager();
+            var client = manager.CreateClient(Check.Config(pbx.Port)); await client.ConnectAsync(); var call = client.CreateCall("123");
+            try { await call.StartAsync().WaitAsync(TimeSpan.FromSeconds(3)); throw new Exception("Expected SIP rejection."); }
+            catch (SipException e) { Check.That(e.StatusCode == code && e.Message.Contains(code.ToString())); }
+            Check.That(call.Status.EndReason == (code == 486 ? SipCallEndReason.Busy : SipCallEndReason.Rejected));
+            Check.That(call.Status.SipStatusCode == code && !string.IsNullOrEmpty(call.Status.SipReasonPhrase) && call.Status.Error!.Contains(call.Status.SipReasonPhrase));
+            Check.That(call.Completion.IsCompletedSuccessfully && client.Calls.Count == 0);
+            await Check.EventuallyAsync(() => pbx.AckRequests > 0);
+            await call.HangupAsync().WaitAsync(TimeSpan.FromSeconds(1));
+            await client.DisconnectAsync();
+        }
+    }),
+    ("Trying and early-media-only calls terminate at the configured answer deadline", async () =>
+    {
+        foreach (int provisional in new[] { 100, 183 })
+        {
+            await using var pbx = new TestPbx { WaitForCancel = true, ProvisionalCode = provisional };
+            await using var manager = new SipClientManager();
+            var client = manager.CreateClient(Check.Config(pbx.Port, answerTimeout: TimeSpan.FromMilliseconds(200)));
+            await client.ConnectAsync(); var call = client.CreateCall("123"); var starting = call.StartAsync();
+            await Check.EventuallyAsync(() => call.Status.SipStatusCode == provisional);
+            Check.That(call.Status.State == SipCallState.Calling && !string.IsNullOrEmpty(call.Status.SipReasonPhrase));
+            await pbx.SendProvisionalAsync(); // Repeated progress must not reset the answer deadline.
+            try { await starting.WaitAsync(TimeSpan.FromSeconds(3)); throw new Exception("Expected answer timeout."); }
+            catch (TimeoutException e) { Check.That(e.Message.Contains("No final SIP answer")); }
+            Check.That(call.Status.EndReason == SipCallEndReason.Timeout && call.Completion.IsCompletedSuccessfully);
+            Check.That(pbx.CancelRequests == 1 && pbx.CancelMatchesInvite && client.Calls.Count == 0);
+            await Check.EventuallyAsync(() => pbx.AckRequests > 0);
+            await client.DisconnectAsync();
+        }
     }),
     ("Provisional response replaces transaction timeout with answer timeout", async () =>
     {
@@ -405,12 +442,14 @@ internal static class Check
     public static void Throws<T>(Action action) where T : Exception
     { try { action(); } catch (T) { return; } throw new Exception($"Expected {typeof(T).Name}"); }
     public static SipClientConfig Config(int port, SipTransportProtocol transport = SipTransportProtocol.Udp, TimeSpan? keepAlive = null,
-        bool autoReconnect = false, TimeSpan? transactionTimeout = null, string id = "test", SipCredentials? credentials = null) => new()
+        bool autoReconnect = false, TimeSpan? transactionTimeout = null, string id = "test", SipCredentials? credentials = null,
+        TimeSpan? answerTimeout = null, TimeSpan? maxQueuedAudio = null) => new()
     {
         Id = id, Registrar = "127.0.0.1", Port = port, User = credentials?.Username ?? "test-user", Domain = "example.test", Transport = transport,
         Credentials = credentials ?? new() { Username = "test-user", Password = "test-password" }, LocalAddress = IPAddress.Loopback,
         AutoReconnect = autoReconnect, TransactionTimeout = transactionTimeout ?? TimeSpan.FromSeconds(2), InitialRetransmitInterval = TimeSpan.FromMilliseconds(50),
-        KeepAliveInterval = keepAlive ?? TimeSpan.FromSeconds(25), ReconnectDelay = TimeSpan.FromMilliseconds(50)
+        KeepAliveInterval = keepAlive ?? TimeSpan.FromSeconds(25), ReconnectDelay = TimeSpan.FromMilliseconds(50),
+        CallAnswerTimeout = answerTimeout ?? TimeSpan.FromSeconds(45), MaxQueuedAudio = maxQueuedAudio ?? TimeSpan.FromSeconds(3)
     };
     public static byte[] Rtp(ushort sequence, uint timestamp, byte[] payload)
     {

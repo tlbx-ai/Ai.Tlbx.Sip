@@ -13,6 +13,13 @@ public sealed class PcmResampler
         if (inputRate is < 8000 or > 192000 || outputRate is < 8000 or > 192000) throw new ArgumentOutOfRangeException(nameof(inputRate));
         _inputRate = inputRate; _outputRate = outputRate;
     }
+    internal int OutputLength(int additionalSamples, bool endOfStream)
+    {
+        if (_inputRate == _outputRate) return additionalSamples;
+        long available = _received + additionalSamples - (endOfStream ? 0 : Radius);
+        long total = available <= 0 ? 0 : (available * _outputRate + _inputRate - 1) / _inputRate;
+        return checked((int)Math.Max(0, total - _produced));
+    }
     public short[] Process(ReadOnlySpan<short> samples, bool endOfStream = false)
     {
         if (_finished) throw new InvalidOperationException("Resampler has been flushed. Reset before reusing it.");

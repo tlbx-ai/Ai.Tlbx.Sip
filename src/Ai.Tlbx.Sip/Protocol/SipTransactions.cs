@@ -75,11 +75,20 @@ internal sealed class SipTransactions(SipClientConfig config, TimeProvider time)
             {
                 var final = await CancelInviteAsync(request, pending, transport);
                 if (cancellationToken.IsCancellationRequested) return final;
+                // A local deadline remains a TimeoutException, so its final
+                // response bypasses RequestAuthenticatedAsync's normal ACK path.
+                if (final.StatusCode >= 300)
+                {
+                    using var ackDeadline = new CancellationTokenSource(config.TransactionTimeout, time);
+                    await transport.SendAsync(SipMessage.FailureAck(request, final), ackDeadline.Token);
+                }
             }
             catch (Exception error) when (error is OperationCanceledException or TimeoutException or IOException or System.Net.Sockets.SocketException)
             { /* The original cancellation/timeout remains the public outcome. */ }
             if (cancellationToken.IsCancellationRequested) throw new OperationCanceledException(cancellationToken);
-            throw new TimeoutException("SIP INVITE transaction timed out.");
+            throw new TimeoutException(pending.Provisional
+                ? $"No final SIP answer within {config.CallAnswerTimeout.TotalSeconds:g} seconds after provisional progress. The destination may be unavailable."
+                : $"No SIP response within {config.TransactionTimeout.TotalSeconds:g} seconds.");
         }
         catch (OperationCanceledException) when (deadline.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
         { throw new TimeoutException($"SIP {request.Method} transaction timed out."); }

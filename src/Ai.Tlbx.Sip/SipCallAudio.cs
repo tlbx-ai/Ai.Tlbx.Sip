@@ -61,7 +61,9 @@ public sealed class SipCallAudio : IAsyncDisposable
             int port = ((IPEndPoint)rtp.Client.LocalEndPoint!).Port;
             if ((port & 1) != 0) { rtp.Dispose(); continue; }
             try { return (rtp, new UdpClient(new IPEndPoint(address, port + 1))); }
-            catch (SocketException e) when (e.SocketErrorCode == SocketError.AddressAlreadyInUse) { rtp.Dispose(); }
+            // Windows can assign the RTP port beside an excluded/reserved UDP
+            // port. Discard that pair and retry without changing OS reservations.
+            catch (SocketException e) when (e.SocketErrorCode is SocketError.AddressAlreadyInUse or SocketError.AccessDenied) { rtp.Dispose(); }
             catch { rtp.Dispose(); throw; }
         }
         throw new IOException("Could not reserve an adjacent RTP/RTCP UDP port pair.");
@@ -87,15 +89,20 @@ public sealed class SipCallAudio : IAsyncDisposable
         lock (_gate)
         {
             if (_disposed || _stop.IsCancellationRequested || !_started) return false;
-            int estimate = (int)Math.Ceiling((double)samples.Length * CodecSampleRate / sampleRate) + 128;
+            bool change = _txResampler is null || _txInputRate != sampleRate;
+            var resampler = change ? new PcmResampler(sampleRate, CodecSampleRate) : _txResampler!;
+            // Reserve the exact eventual output, including the filter tail. A
+            // fixed safety margin can reject every slice of a valid 20-ms queue.
+            long estimate = resampler.OutputLength(samples.Length, endOfStream: true) +
+                (change ? _txResampler?.OutputLength(0, endOfStream: true) ?? 0 : 0);
             if (_outbound.Count + estimate > _config.MaxQueuedAudio.TotalSeconds * CodecSampleRate) return false;
-            if (_txResampler is null || _txInputRate != sampleRate)
+            if (change)
             {
                 if (_txResampler is not null)
                     foreach (short s in _txResampler.Process([], endOfStream: true)) _outbound.Enqueue(s);
-                _txResampler = new(sampleRate, CodecSampleRate); _txInputRate = sampleRate;
+                _txResampler = resampler; _txInputRate = sampleRate;
             }
-            foreach (short s in _txResampler.Process(samples)) _outbound.Enqueue(s);
+            foreach (short s in resampler.Process(samples)) _outbound.Enqueue(s);
             return true;
         }
     }

@@ -34,7 +34,7 @@ public sealed class SipClientConfig
     public int RegistrationLifetimeSeconds { get; init; } = 300;
     public TimeSpan KeepAliveInterval { get; init; } = TimeSpan.FromSeconds(25);
     public TimeSpan TransactionTimeout { get; init; } = TimeSpan.FromSeconds(32);
-    public TimeSpan CallAnswerTimeout { get; init; } = TimeSpan.FromMinutes(2);
+    public TimeSpan CallAnswerTimeout { get; init; } = TimeSpan.FromSeconds(45);
     public TimeSpan InitialRetransmitInterval { get; init; } = TimeSpan.FromMilliseconds(500);
     public TimeSpan ReconnectDelay { get; init; } = TimeSpan.FromSeconds(3);
     public bool AutoReconnect { get; init; } = true;
@@ -74,7 +74,7 @@ public sealed class SipClientConfig
 public sealed record SipClientStatus(SipClientState State, DateTimeOffset ChangedAt,
     DateTimeOffset? RegistrationExpiresAt = null, string? Error = null, int? SipStatusCode = null);
 public sealed record SipCallStatus(SipCallState State, DateTimeOffset ChangedAt,
-    SipCallEndReason? EndReason = null, int? SipStatusCode = null, string? Error = null);
+    SipCallEndReason? EndReason = null, int? SipStatusCode = null, string? Error = null, string? SipReasonPhrase = null);
 public sealed record SipMediaMetrics(long TransmittedPackets, long ReceivedPackets, long TransmittedBytes,
     long ReceivedBytes, long LostPackets, long DuplicatePackets, long LatePackets,
     double JitterMilliseconds, double? RoundTripMilliseconds, TimeSpan QueuedAudio,

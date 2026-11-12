@@ -1,0 +1,79 @@
+name: Publish NuGet
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Exact stable version committed in Directory.Build.props
+        required: true
+        type: string
+      publish:
+        description: Submit immutable NuGet versions (false only verifies packages and OIDC login)
+        required: true
+        default: false
+        type: boolean
+permissions:
+  contents: read
+concurrency:
+  group: nuget-publish
+  cancel-in-progress: false
+jobs:
+  verify:
+    if: github.ref == 'refs/heads/main'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4
+        with:
+          dotnet-version: '11.0.x'
+      - name: Check requested version
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          [xml]$props = Get-Content Directory.Build.props
+          if ($env:RELEASE_VERSION -notmatch '^\d+\.\d+\.\d+$' -or [string]$props.Project.PropertyGroup.Version -ne $env:RELEASE_VERSION) { throw 'Requested and committed stable versions must match.' }
+      - run: ./verify-release.ps1
+  publish:
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: nuget
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4
+        with:
+          dotnet-version: '11.0.x'
+      - name: Pack release
+        run: |
+          dotnet pack src/Ai.Tlbx.Sip -c Release -o artifacts/nuget
+          dotnet pack src/Ai.Tlbx.VoiceAssistant.Sip -c Release -o artifacts/nuget
+      - name: NuGet login with GitHub OIDC
+        id: login
+        uses: NuGet/login@ebc737b6fc418a6ca0073cf116ec8dc156d8b81e # v1
+        with:
+          user: Ai.Tlbx
+      - name: Publish both packages
+        if: inputs.publish
+        env:
+          NUGET_API_KEY: ${{ steps.login.outputs.NUGET_API_KEY }}
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          dotnet nuget push "artifacts/nuget/Ai.Tlbx.Sip.$RELEASE_VERSION.nupkg" --api-key "$NUGET_API_KEY" --source https://api.nuget.org/v3/index.json --skip-duplicate
+          dotnet nuget push "artifacts/nuget/Ai.Tlbx.VoiceAssistant.Sip.$RELEASE_VERSION.nupkg" --api-key "$NUGET_API_KEY" --source https://api.nuget.org/v3/index.json --skip-duplicate
+      - name: Report verified preparation
+        if: ${{ !inputs.publish }}
+        run: echo 'Both platform gates and NuGet OIDC login succeeded. No packages submitted.' >> "$GITHUB_STEP_SUMMARY"

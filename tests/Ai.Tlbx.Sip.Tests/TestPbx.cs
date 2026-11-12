@@ -32,6 +32,7 @@ internal sealed class TestPbx : IAsyncDisposable
     public bool HoldProvisional { get; init; }
     public bool AnswerOnCancel { get; init; }
     public int RejectCallWith { get; init; }
+    public int ProvisionalCode { get; init; } = 180;
     public int? GrantedExpirySeconds { get; init; }
     public volatile bool DropRegistrationResponses;
     public int AckRequests { get; private set; }
@@ -85,7 +86,8 @@ internal sealed class TestPbx : IAsyncDisposable
                     _outgoingInvite = request; InviteReceived.TrySetResult();
                     if (RejectCallWith > 0)
                     {
-                        _lastInviteAnswer = SipMessage.Response(request, RejectCallWith, "Rejected", "remote-tag");
+                        _lastInviteAnswer = SipMessage.Response(request, RejectCallWith, RejectCallWith switch
+                        { 404 => "Not Found", 484 => "Address Incomplete", 604 => "Does Not Exist Anywhere", _ => "Busy Here" }, "remote-tag");
                         await SendAsync(_lastInviteAnswer); continue;
                     }
                     var offer = SdpSession.Parse(request.Body, Ai.Tlbx.Sip.SipMediaSecurity.Unencrypted); _clientMedia = new(offer.Address, offer.Port);
@@ -131,7 +133,8 @@ internal sealed class TestPbx : IAsyncDisposable
         return fields["response"] == expected;
     }
     public async Task SendAsync(SipMessage message) => await _sip.SendAsync(message.Serialize(), _client!);
-    public Task SendProvisionalAsync() => SendAsync(SipMessage.Response(_outgoingInvite!, 180, "Ringing", "remote-tag"));
+    public Task SendProvisionalAsync() => SendAsync(SipMessage.Response(_outgoingInvite!, ProvisionalCode,
+        ProvisionalCode switch { 100 => "Trying", 183 => "Session Progress", _ => "Ringing" }, "remote-tag"));
     public async Task AnswerOutgoingAsync()
     {
         var answer = SipMessage.Response(_outgoingInvite!, 200, "OK", "remote-tag");

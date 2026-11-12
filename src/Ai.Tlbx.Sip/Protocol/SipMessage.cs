@@ -17,6 +17,7 @@ internal sealed class SipMessage
     public byte[] Body { get; set; } = [];
     public bool IsResponse => StartLine.StartsWith("SIP/2.0 ", StringComparison.Ordinal);
     public int StatusCode => IsResponse ? int.Parse(StartLine.Split(' ', 3)[1], CultureInfo.InvariantCulture) : 0;
+    public string ReasonPhrase => IsResponse ? StartLine.Split(' ', 3).ElementAtOrDefault(2) ?? "" : "";
     public string Method => IsResponse ? CSeqMethod : StartLine.Split(' ', 3)[0];
     public string RequestUri => StartLine.Split(' ', 3)[1];
     public string CSeqMethod => Get("CSeq").Split(' ', StringSplitOptions.RemoveEmptyEntries).LastOrDefault() ?? "";
@@ -31,6 +32,14 @@ internal sealed class SipMessage
         Headers.Add(new(name, value));
     }
     public void Set(string name, string value) { Headers.RemoveAll(h => h.Key.Equals(name, StringComparison.OrdinalIgnoreCase)); Add(name, value); }
+    public static SipMessage FailureAck(SipMessage invite, SipMessage response)
+    {
+        var ack = new SipMessage { StartLine = $"ACK {invite.RequestUri} SIP/2.0" };
+        foreach (string name in new[] { "Via", "From", "Call-ID", "Max-Forwards", "Route" })
+            foreach (string value in invite.GetAll(name)) ack.Add(name, value);
+        ack.Add("To", response.Get("To")); ack.Add("CSeq", invite.CSeqNumber + " ACK");
+        return ack;
+    }
     public byte[] Serialize()
     {
         var text = new StringBuilder().Append(StartLine).Append("\r\n");

@@ -73,14 +73,21 @@ public sealed class SipCall : IAsyncDisposable
             {
                 if (p.StatusCode >= 200) _lastResponse = p;
                 lock (_gate)
-                    if (p.StatusCode is 180 or 183 && !_ending && Status.State == SipCallState.Calling) SetStatus(SipCallState.Ringing, p.StatusCode);
+                    if (p.StatusCode is >= 100 and < 200 && !_ending && Status.State is SipCallState.Calling or SipCallState.Ringing)
+                        SetStatus(p.StatusCode == 180 ? SipCallState.Ringing : Status.State, p.StatusCode, phrase: p.ReasonPhrase);
             }, linked.Token);
             if (response.StatusCode >= 300)
             {
                 bool wasCancelled = cancellationToken.IsCancellationRequested || _dialCancellation.IsCancellationRequested;
-                await EndAsync(wasCancelled ? SipCallEndReason.Cancelled : response.StatusCode is 486 or 600 ? SipCallEndReason.Busy : response.StatusCode == 487 ? SipCallEndReason.Cancelled : SipCallEndReason.Rejected, response.StatusCode);
+                string error = response.StatusCode switch
+                {
+                    404 or 604 => $"Destination not found (SIP {response.StatusCode} {response.ReasonPhrase}).",
+                    484 => $"Destination number is incomplete (SIP 484 {response.ReasonPhrase}).",
+                    _ => $"Call rejected (SIP {response.StatusCode} {response.ReasonPhrase})."
+                };
+                await EndAsync(wasCancelled ? SipCallEndReason.Cancelled : response.StatusCode is 486 or 600 ? SipCallEndReason.Busy : response.StatusCode == 487 ? SipCallEndReason.Cancelled : SipCallEndReason.Rejected, response.StatusCode, error, response.ReasonPhrase);
                 if (wasCancelled) throw new OperationCanceledException(linked.Token);
-                throw new SipException(response.StatusCode, $"Call rejected with SIP {response.StatusCode}.");
+                throw new SipException(response.StatusCode, error);
             }
             SetRemoteDialog(response);
             await AckAsync(response);
@@ -90,7 +97,7 @@ public sealed class SipCall : IAsyncDisposable
             {
                 if (Status.State == SipCallState.Ended) return;
                 cancel = _ending || linked.IsCancellationRequested;
-                if (!cancel) { Audio.Start(session); SetStatus(SipCallState.Established, response.StatusCode); }
+                if (!cancel) { Audio.Start(session); SetStatus(SipCallState.Established, response.StatusCode, phrase: response.ReasonPhrase); }
             }
             if (cancel)
             {
@@ -285,7 +292,7 @@ public sealed class SipCall : IAsyncDisposable
         else if (request.Method == "OPTIONS") await _client.ReplyAsync(request, SipMessage.Response(request, 200, "OK"));
         else await _client.ReplyAsync(request, SipMessage.Response(request, request.Method == "INVITE" ? 488 : 405, "Not Supported", _localTag));
     }
-    internal async Task EndAsync(SipCallEndReason reason, int? code = null, string? error = null)
+    internal async Task EndAsync(SipCallEndReason reason, int? code = null, string? error = null, string? phrase = null)
     {
         bool ownsCleanup;
         lock (_gate)
@@ -293,15 +300,15 @@ public sealed class SipCall : IAsyncDisposable
             ownsCleanup = Status.State != SipCallState.Ended;
             if (ownsCleanup)
             {
-                _stop.Cancel(); SetStatus(SipCallState.Ended, code, reason, error); _client.Forget(this);
+                _stop.Cancel(); SetStatus(SipCallState.Ended, code, reason, error, phrase); _client.Forget(this);
             }
         }
         if (!ownsCleanup) { await Completion; return; }
         await Audio.DisposeAsync(); _completion.TrySetResult(Status); Publish(Ended, Status);
     }
-    private void SetStatus(SipCallState state, int? code = null, SipCallEndReason? reason = null, string? error = null)
+    private void SetStatus(SipCallState state, int? code = null, SipCallEndReason? reason = null, string? error = null, string? phrase = null)
     {
-        var status = new SipCallStatus(state, _client.Time.GetUtcNow(), reason, code, error);
+        var status = new SipCallStatus(state, _client.Time.GetUtcNow(), reason, code, error, phrase);
         Volatile.Write(ref _status, status); Publish(StatusChanged, status);
     }
     private void Publish(EventHandler<SipCallStatus>? handlers, SipCallStatus status)

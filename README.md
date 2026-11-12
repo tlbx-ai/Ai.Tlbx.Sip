@@ -4,9 +4,9 @@ Managed SIP clients with observable connection state, call objects, and bidirect
 
 The SIP library handles telephony. Applications decide whether to connect a call to an audio device, a recorder, or an AI voice assistant. Multiple independently authenticated SIP identities can run in the same process.
 
-> **Early development.** Protocol and media tests pass on Windows and Linux against a simulated PBX. Real FRITZ!Box testing covers registration, incoming and outgoing calls, bidirectional echo audio, remote hangup, and clean unregistration. An outgoing G.722 acceptance call sustained approximately 2,800 packets in each direction without detected sequence loss; the listener confirmed continuous, clear audio with a stable perceived delay. The first incoming test had approximately one second of perceived round-trip delay; latency has not yet been attributed to individual components. easybell interoperability, security review, and broader failure-mode coverage are still pending. Do not treat this initial implementation as production-ready.
+Version 1.0.0 provides direct PBX registration, incoming/outgoing calls and managed PCM media with explicit lifetime, cancellation and error handling. Protocol/media checks run on Windows and Linux. Real FRITZ!Box acceptance covers registration, incoming/outgoing echo calls, remote hangup and clean unregistration. The VoiceAssistant Web demo has also been tested over a real phone call: long AI answers play completely, and speaking over the agent interrupts playback and changes the conversation topic. See the supported transports and interoperability limits below.
 
-RTCP/SRTCP was added after that FRITZ!Box acceptance and is verified against local network peers and independent encryption vectors. This newer control path has not yet been retested against a real PBX.
+Encrypted RTP/RTCP is verified with local peers and independent numeric reference vectors; encrypted interoperability with a real provider remains unverified. Earlier echo acceptance included clear continuous G.722 audio and roughly one second perceived echo delay; this is not a measured one-way or AI response latency.
 
 ## Projects
 
@@ -17,6 +17,16 @@ RTCP/SRTCP was added after that FRITZ!Box acceptance and is verified against loc
 | `SipConsole` | Explicitly controlled registration, incoming/outgoing calls, and optional audio echo. |
 
 Uses .NET 11 and C# 15. The SIP core references the cross-platform MIT-licensed `NAudio.Core` package for its managed G.722 codec. The VoiceAssistant adapter references the published VoiceAssistant package. No native SIP/media binary, FFmpeg, ALSA, or Windows audio API is required by these libraries.
+
+## Install
+
+```sh
+dotnet add package Ai.Tlbx.Sip --version 1.0.0
+# Optional AI audio adapter (also installs the SIP core):
+dotnet add package Ai.Tlbx.VoiceAssistant.Sip --version 1.0.0
+```
+
+Until the initial publication completes, build from source or use the locally verified packages produced by `verify-release.ps1`.
 
 ## Create and connect a client
 
@@ -73,7 +83,9 @@ await call.HangupAsync();
 
 Cancelling `StartAsync` also cancels the remote call attempt. The endpoint waits for the required provisional response before sending CANCEL, acknowledges the final INVITE response, and closes an answer racing cancellation with ACK followed by BYE. Short-lived bounded transaction/dialog history handles retransmitted final responses after local teardown without creating duplicate BYE transactions.
 
-`TransactionTimeout` defaults to 32 seconds for initial transaction response handling. Once an INVITE receives its first provisional response, `CallAnswerTimeout` applies instead (default: two minutes). Ringing is therefore not cut off by the initial transaction timeout.
+`TransactionTimeout` defaults to 32 seconds for initial transaction response handling. Once an INVITE receives its first provisional response, `CallAnswerTimeout` applies instead (default: 45 seconds); repeated progress does not extend it. Both deadlines are configurable. Cancellation/timeout performs bounded SIP cleanup, which can add up to a further transaction timeout if the PBX stops responding.
+
+`call.Status.SipStatusCode` and `SipReasonPhrase` retain the PBX response. `404`/`604` (unknown destination), `484` (incomplete number) and other final failures end the call immediately, populate `Status.Error`, and throw `SipException` with the native code. A `100 Trying` or `183 Session Progress` alone is not an accepted call or proof of a valid number; an announcement-only/progress-only exchange eventually ends as `Timeout`. The library cannot determine telephone number validity independently of the PBX/provider response, and does not play pre-answer announcements to the AI.
 
 Incoming calls are delivered as call objects. Answering is always an application decision:
 
@@ -178,7 +190,13 @@ dotnet pack src/Ai.Tlbx.Sip -c Release -o artifacts
 dotnet pack src/Ai.Tlbx.VoiceAssistant.Sip -c Release -o artifacts
 ```
 
-The test runner requires no test framework and returns a nonzero exit code on failure. It covers framing, parser rejection, G.711 values, resampling continuity and anti-aliasing, RFC 3711 key-derivation vectors, SRTP tamper/replay rejection and rollover, registration/authentication, UDP retransmission, TCP stream fragmentation, contact selection, registration expiry/recovery, refresh/disconnect ordering, call setup/teardown, cancellation/acceptance races, late final responses, duplicate INVITEs, early-media backlog, silence suppression, PCM flow, G.722, and the VoiceAssistant adapter. TLS tests exchange SIP over real encrypted loopback connections and verify rejection of unknown certificate authorities and wrong hostnames, using an ephemeral test CA without changing machine trust stores. Builds and tests have been run on Windows and Debian Linux. A Windows/Linux CI template is provided in `.github/verify-workflow.template.yml`; enabling it requires moving it into `.github/workflows/verify.yml` with a GitHub credential authorized to write workflows. No PBX credentials or paid AI calls are needed.
+The test runner requires no test framework and returns a nonzero exit code on failure. It covers framing, parser rejection, G.711 values, resampling continuity and anti-aliasing, RFC 3711 key-derivation vectors, SRTP tamper/replay rejection and rollover, registration/authentication, UDP retransmission, TCP stream fragmentation, contact selection, registration expiry/recovery, refresh/disconnect ordering, call setup/teardown, cancellation/acceptance races, late final responses, duplicate INVITEs, invalid destinations, progress-only timeouts and their final ACKs, early-media backlog, silence suppression, PCM flow, G.722, minimum-size transmit buffers and the VoiceAssistant adapter. TLS tests exchange SIP over real encrypted loopback connections and verify rejection of unknown certificate authorities and wrong hostnames, using an ephemeral test CA without changing machine trust stores. Builds and tests run on Windows and Debian Linux without PBX credentials or paid AI calls. The VoiceAssistant demo's additional local-peer tests verify complete ordered RTP sections for an AI burst longer than the SIP transmit buffer.
+
+Run `pwsh ./verify-release.ps1` for the release gate: build, protocol/media checks, both packages, identity/license/dependency checks, and a fresh-cache consumer outside the repository without project references. Packages and SHA-256 verification metadata are written under `artifacts/release/<version>/`. GitHub `verify.yml` runs this gate on Windows and Linux.
+
+## Publishing
+
+`publish-nuget.yml` is manual (`workflow_dispatch`), accepts the exact committed stable version, and only runs from `main`. It requires the Windows/Linux release gates before the publishing job can obtain a short-lived NuGet credential. The `publish` input defaults to `false`: this verifies both platforms and the real NuGet OIDC login without submitting packages. Set it to `true` only for the actual publication. The GitHub environment is `nuget`; the NuGet Trusted Publishing policy must match owner `tlbx-ai`, repository `Ai.Tlbx.Sip`, workflow filename `publish-nuget.yml`, environment `nuget` and package owner `Ai.Tlbx`. A package glob `Ai.Tlbx.*` covers both packages. No long-lived NuGet API key is required. Preparing or verifying packages does not publish them.
 
 RTCP/SRTCP coverage includes independent libSRTP numeric encryption fixtures, signed cumulative loss and sequence rollover, NTP/report fields, monotonic RTT excluding remote processing delay, explicit SDP control endpoints, UDP port-pair release, actual encrypted and plaintext loopback exchanges, malformed-control rejection, and uninterrupted RTP when the remote RTCP port is closed. Only numeric reference data is used from [libSRTP's interoperability tests](https://github.com/cisco/libsrtp/blob/main/test/srtp_driver.c); the implementation is written against the RFCs.
 
