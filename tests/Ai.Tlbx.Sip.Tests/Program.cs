@@ -218,7 +218,11 @@ var cases = new (string Name, Func<Task> Run)[]
         await client.ConnectAsync(); var expires = client.Status.RegistrationExpiresAt;
         pbx.DropRegistrationResponses = true;
         await Check.EventuallyAsync(() => client.Status.State == SipClientState.Failed);
-        Check.That(DateTimeOffset.UtcNow >= expires && client.Status.Error!.Contains("expired"));
+        var failed = client.Status;
+        // System timers use whole milliseconds. Compare the transition with the expiry, allowing for timer rounding.
+        Check.That(expires is { } expiration && failed.ChangedAt >= expiration - TimeSpan.FromMilliseconds(2) &&
+            failed.Error?.Contains("expired", StringComparison.Ordinal) == true,
+            $"Expected registration expiry at {expires:O}; transitioned at {failed.ChangedAt:O}: {failed.Error}");
         Check.Throws<InvalidOperationException>(() => client.CreateCall("123"));
         await client.DisconnectAsync();
     }),
