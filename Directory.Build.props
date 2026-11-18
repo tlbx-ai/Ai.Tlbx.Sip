@@ -5,9 +5,9 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
-    <Version>11.13.0</Version>
-    <VoiceAssistantVersion>11.13.0</VoiceAssistantVersion>
-    <PackageReleaseNotes>Hold/resume and in-dialog media refresh; blind and attended REFER transfers; caller, called-party and diversion identities. Retains bounded SRTP replay windows for the key lifetime and correlates REFER subscriptions across retries. Windows/Linux, .NET 10/11.</PackageReleaseNotes>
+    <Version>11.13.1</Version>
+    <VoiceAssistantVersion>11.13.1</VoiceAssistantVersion>
+    <PackageReleaseNotes>Fix sequential REFER transfers on PBXs such as easybell that omit the NOTIFY Event ID when earlier subscriptions have ended.</PackageReleaseNotes>
     <ContinuousIntegrationBuild Condition="'$(CI)' == 'true'">true</ContinuousIntegrationBuild>
     <Deterministic>true</Deterministic>
     <PackageTags>sip;telephony;rtp;pcm;voice;managed</PackageTags>
