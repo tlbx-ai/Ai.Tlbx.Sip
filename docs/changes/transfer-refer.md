@@ -48,6 +48,7 @@ With REFER the PBX joins the two parties itself. The AI then leaves both calls a
 `SipCall.cs` (`OnNotifyAsync`)
 
 - In-dialog NOTIFY with `Event: refer` is answered with `200 OK`. The first line of the `message/sipfrag` body (`SIP/2.0 <code> <reason>`) is parsed. A status `>= 200` completes the waiting transfer; `Subscription-State: terminated` without a final status completes it as `Unknown`.
+- A supplied Event ID must match the current REFER CSeq. For PBXs that omit it, a later bare `Event: refer` can match when each earlier REFER was rejected or its subscription reported termination.
 - Any other event package gets `489 Bad Event`.
 
 ## Public API additions
@@ -80,6 +81,8 @@ Reported separately from the mock tests. Test endpoint: a dedicated extension of
 | Blind transfer (`--transfer-test`) | `202`, final NOTIFY `200 OK` after about 0.2 s, BYE sent, desk phone rings, mobile and desk phone connected |
 | Attended transfer, colleague answers (`--attended-test`) | caller held with hold tone, consultation call answered, announcement tone heard at the desk phone, REFER with Replaces answered `200 OK` after 0.14 to 0.17 s, the PBX ended the consultation dialog, mobile and desk phone connected directly (tested twice) |
 | Attended transfer, colleague does not answer | consultation call cancelled after 20 s, caller resumed by re-INVITE in about 0.1 s, audio back |
+
+In Alexander Kuntze's 11.13.0 easybell retest, the PBX's blind-transfer `200 OK` sipfrag arrived when the target started ringing. `Succeeded` reports the PBX's transfer result. Applications cannot use it as proof that the target answered.
 
 Observation: a plain 440 Hz hold tone was barely audible on the mobile phone while it was clearly audible on the desk phone. Mobile networks and handsets suppress steady tones; real hold music or a spoken announcement is the better choice.
 

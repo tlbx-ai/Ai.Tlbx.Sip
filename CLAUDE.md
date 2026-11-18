@@ -5,7 +5,7 @@ Build with the .NET 11 SDK / C# 15. Both libraries, protocol tests and console t
 Implement protocol behavior from the RFCs. Preserve native SIP status codes alongside application-level states. `Connected` means authenticated registration and incoming-call readiness, maintained by monitoring and renewal.
 The SIP core and VoiceAssistant adapter share the VoiceAssistant release version. VoiceAssistantVersion must match the central Version property; release checks must verify both package versions and per-target dependencies.
 
-SRTP receive replay windows must survive for the full key lifetime. Bound stream count by rejecting new SSRCs at capacity; never evict replay state and reopen old packets. REFER NOTIFY must match the originating REFER CSeq, including authentication retries; an omitted Event id is valid only for the first REFER in a dialog. Cover stale notifications and notifications before the REFER response.
+SRTP receive replay windows must survive for the full key lifetime. Bound stream count by rejecting new SSRCs at capacity; never evict replay state and reopen old packets. REFER NOTIFY must match the originating REFER CSeq, including authentication retries; accept an omitted Event id on later REFERs only when no earlier subscription may still be open. A final sipfrag with an active subscription does not establish termination. Cover sequential bare notifications, unresolved subscriptions, stale identified notifications and notifications before the REFER response.
 
 Keep all audio, jitter and transaction buffers bounded. Preserve resampler/codec state across frames. Use platform cryptographic primitives and verify protocol-level encryption against independent vectors. Never disable TLS hostname or certificate validation.
 

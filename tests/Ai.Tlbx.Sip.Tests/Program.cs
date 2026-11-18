@@ -42,18 +42,54 @@ var cases = new (string Name, Func<Task> Run)[]
         Check.That(second.Outcome == SipTransferOutcome.Succeeded, "A stale first subscription must not complete the second: " + second);
         await client.DisconnectAsync();
     }),
-    ("Unidentified later transfer NOTIFY cannot end the wrong call", async () =>
+    ("A failed attended transfer can be followed by a blind transfer with bare REFER notifications", async () =>
     {
-        await using var pbx = new TestPbx { OmitReferEventId = true, TransferFinalCode = 486 };
+        await using var pbx = new TestPbx { OmitReferEventId = true, TransferFinalCode = 404 };
+        await using var manager = new SipClientManager();
+        var client = manager.CreateClient(Check.Config(pbx.Port, answerTimeout: TimeSpan.FromMilliseconds(300), transactionTimeout: TimeSpan.FromMilliseconds(500)));
+        await client.ConnectAsync();
+        var call = client.CreateCall("123"); await call.StartAsync();
+        var consultation = client.CreateCall("50"); await consultation.StartAsync();
+        var failed = await call.TransferToCallAsync(consultation).WaitAsync(TimeSpan.FromSeconds(3));
+        Check.That(failed.Outcome == SipTransferOutcome.Failed && failed.StatusCode == 404);
+        Check.That(call.Status.State == SipCallState.Established && consultation.Status.State == SipCallState.Established);
+
+        pbx.TransferFinalCode = 200;
+        var second = await call.TransferAsync("51").WaitAsync(TimeSpan.FromSeconds(3));
+        Check.That(second.Outcome == SipTransferOutcome.Succeeded && second.StatusCode == 200, second.ToString());
+        Check.That((await call.Completion).EndReason == SipCallEndReason.Transferred);
+        await consultation.HangupAsync();
+        await client.DisconnectAsync();
+    }),
+    ("Termination without a final transfer status permits a later bare REFER notification", async () =>
+    {
+        await using var pbx = new TestPbx { OmitReferEventId = true, TransferFinalCode = 100 };
+        await using var manager = new SipClientManager();
+        var client = manager.CreateClient(Check.Config(pbx.Port, answerTimeout: TimeSpan.FromMilliseconds(300), transactionTimeout: TimeSpan.FromMilliseconds(500)));
+        await client.ConnectAsync();
+        var call = client.CreateCall("123"); await call.StartAsync();
+        var first = await call.TransferAsync("50").WaitAsync(TimeSpan.FromSeconds(3));
+        Check.That(first.Outcome == SipTransferOutcome.Unknown && first.ReasonPhrase!.Contains("ended the transfer subscription"));
+
+        pbx.TransferFinalCode = 200;
+        Check.That((await call.TransferAsync("51").WaitAsync(TimeSpan.FromSeconds(3))).Outcome == SipTransferOutcome.Succeeded);
+        await client.DisconnectAsync();
+    }),
+    ("Unidentified later transfer NOTIFY cannot complete while an earlier subscription is unresolved", async () =>
+    {
+        await using var pbx = new TestPbx { OmitReferEventId = true, KeepReferSubscriptionActive = true, TransferFinalCode = 486 };
         await using var manager = new SipClientManager();
         var client = manager.CreateClient(Check.Config(pbx.Port, answerTimeout: TimeSpan.FromMilliseconds(100), transactionTimeout: TimeSpan.FromMilliseconds(300)));
         await client.ConnectAsync();
         var call = client.CreateCall("123"); await call.StartAsync().WaitAsync(TimeSpan.FromSeconds(5));
         Check.That((await call.TransferAsync("50")).Outcome == SipTransferOutcome.Failed);
         pbx.TransferFinalCode = 200;
+        pbx.KeepReferSubscriptionActive = false;
         var second = await call.TransferAsync("51").WaitAsync(TimeSpan.FromSeconds(3));
         Check.That(second.Outcome == SipTransferOutcome.Unknown && call.Status.State == SipCallState.Established);
-        await call.HangupAsync(); await client.DisconnectAsync();
+        pbx.OmitReferEventId = false;
+        Check.That((await call.TransferAsync("52").WaitAsync(TimeSpan.FromSeconds(3))).Outcome == SipTransferOutcome.Succeeded);
+        await client.DisconnectAsync();
     }),
 
     ("SIP framing, UTF-8, compact and repeated headers", () =>

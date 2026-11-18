@@ -33,7 +33,8 @@ public sealed class SipCall : IAsyncDisposable
     private SipMessage? _lastRefreshAck;
     private TaskCompletionSource<(int Code, string Phrase)>? _transferResult;
     private SipMessage? _transferRequest;
-    private bool _hasSentRefer, _transferAllowsMissingId;
+    private bool _earlierReferSubscriptionUnresolved;
+    private bool _transferSubscriptionTerminated;
     private SipPartyIdentity _remoteIdentity;
     /// <summary>RFC 3261 section 14.1: after 491 Request Pending the re-INVITE is retried after a random 2.1 to 4 seconds.</summary>
     internal static TimeSpan GlareRetryMinimum = TimeSpan.FromMilliseconds(2100), GlareRetryMaximum = TimeSpan.FromMilliseconds(4000);
@@ -471,6 +472,7 @@ public sealed class SipCall : IAsyncDisposable
     /// The PBX reports progress with NOTIFY (message/sipfrag). On a 2xx result this side ends its leg with BYE
     /// and the call ends as <see cref="SipCallEndReason.Transferred"/>. If the REFER or the target fails, the
     /// call stays with this side; hold it first with <see cref="HoldAsync"/> if the caller should hear hold audio.
+    /// Some PBXs report success when the target starts ringing, so success does not establish that the target answered.
     /// </summary>
     public Task<SipTransferResult> TransferAsync(string target, CancellationToken cancellationToken = default) =>
         TransferCoreAsync(TransferTargetUri(target), null, cancellationToken);
@@ -514,11 +516,11 @@ public sealed class SipCall : IAsyncDisposable
                 if (Status.State != SipCallState.Established || _ending) throw new InvalidOperationException("Only an established call can be transferred.");
                 result = _transferResult = new(TaskCreationOptions.RunContinuationsAsynchronously);
                 request = _transferRequest = DialogRequest("REFER");
-                _transferAllowsMissingId = !_hasSentRefer;
-                _hasSentRefer = true;
+                _transferSubscriptionTerminated = false;
                 request.Add("Refer-To", "<" + targetUri + ">");
                 request.Add("Referred-By", $"<sip:{Uri.EscapeDataString(_client.Config.User)}@{_client.Config.SipDomain}>");
             }
+            bool referRejected = false;
             try
             {
                 SipMessage response;
@@ -527,7 +529,12 @@ public sealed class SipCall : IAsyncDisposable
                     try { response = await _client.RequestAuthenticatedAsync(request, null, linked.Token); }
                     catch (TimeoutException) { return new(SipTransferOutcome.Failed, 408, "The PBX did not answer the REFER."); }
                 }
-                if (response.StatusCode >= 300) return new(SipTransferOutcome.Failed, response.StatusCode, response.ReasonPhrase);
+                if (response.StatusCode >= 300)
+                {
+                    // An intermediary can report a timeout after the peer accepted the REFER.
+                    referRejected = response.StatusCode is not (408 or 504);
+                    return new(SipTransferOutcome.Failed, response.StatusCode, response.ReasonPhrase);
+                }
                 // The target may ring for up to the call answer timeout before the PBX sends the final NOTIFY.
                 using var deadline = new CancellationTokenSource(_client.Config.CallAnswerTimeout + _client.Config.TransactionTimeout, _client.Time);
                 using var wait = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, deadline.Token, _stop.Token);
@@ -565,8 +572,13 @@ public sealed class SipCall : IAsyncDisposable
             }
             finally
             {
-                lock (_gate) if (ReferenceEquals(_transferResult, result))
-                { _transferResult = null; _transferRequest = null; }
+                lock (_gate)
+                {
+                    if (!referRejected && !_transferSubscriptionTerminated)
+                        _earlierReferSubscriptionUnresolved = true;
+                    _transferResult = null;
+                    _transferRequest = null;
+                }
             }
         }
         finally { _renegotiation.Release(); }
@@ -590,14 +602,14 @@ public sealed class SipCall : IAsyncDisposable
         string eventPackage = request.Get("Event").Split(';')[0].Trim();
         if (!eventPackage.Equals("refer", StringComparison.OrdinalIgnoreCase))
         { await _client.ReplyAsync(request, SipMessage.Response(request, 489, "Bad Event", _localTag)); return; }
-        // RFC 3515 section 2.4.6: only the first REFER can omit Event's id. Later
-        // subscriptions use the REFER CSeq, including a changed CSeq after authentication.
+        // RFC 3515 section 2.4.6 requires the REFER CSeq on later subscriptions.
+        // For PBXs that always omit it, accept bare events only while this subscription is unambiguous.
         TaskCompletionSource<(int Code, string Phrase)>? pending;
         string id = SipMessage.Parameter(request.Get("Event"), "id");
         lock (_gate)
         {
             pending = _transferRequest is not null &&
-                (id.Length == 0 ? _transferAllowsMissingId :
+                (id.Length == 0 ? !_earlierReferSubscriptionUnresolved :
                     id == _transferRequest.CSeqNumber.ToString(System.Globalization.CultureInfo.InvariantCulture))
                 ? _transferResult : null;
         }
@@ -612,9 +624,15 @@ public sealed class SipCall : IAsyncDisposable
         if (parts.Length >= 2 && parts[0].StartsWith("SIP/", StringComparison.OrdinalIgnoreCase) &&
             int.TryParse(parts[1], System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out int parsed))
         { code = parsed; phrase = parts.Length > 2 ? parts[2] : ""; }
-        bool terminated = request.Get("Subscription-State").TrimStart().StartsWith("terminated", StringComparison.OrdinalIgnoreCase);
-        if (code is >= 200 and <= 699) pending.TrySetResult((code, phrase));
-        else if (terminated) pending.TrySetResult((0, "The PBX ended the transfer subscription without a final result."));
+        bool terminated = request.Get("Subscription-State").Split(';')[0].Trim()
+            .Equals("terminated", StringComparison.OrdinalIgnoreCase);
+        lock (_gate)
+        {
+            if (!ReferenceEquals(_transferResult, pending)) return;
+            if (terminated) _transferSubscriptionTerminated = true;
+            if (code is >= 200 and <= 699) pending.TrySetResult((code, phrase));
+            else if (terminated) pending.TrySetResult((0, "The PBX ended the transfer subscription without a final result."));
+        }
     }
     private async Task TerminateDialogAsync(string reason)
     {

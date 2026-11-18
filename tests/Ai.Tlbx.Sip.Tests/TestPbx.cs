@@ -41,6 +41,7 @@ internal sealed class TestPbx : IAsyncDisposable
     public SipMessage? LastRefer { get; private set; }
     public bool InjectStaleReferNotify { get; set; }
     public bool OmitReferEventId { get; set; }
+    public bool KeepReferSubscriptionActive { get; set; }
     public bool NotifyBeforeReferResponse { get; set; }
     public bool ChallengeRefer { get; set; }
     public int RejectReferWith { get; set; }
@@ -126,7 +127,9 @@ internal sealed class TestPbx : IAsyncDisposable
                         await SendAsync(stale);
                     }
                     await SendAsync(ReferNotify(request, "SIP/2.0 100 Trying", "active;expires=60"));
-                    await SendAsync(ReferNotify(request, $"SIP/2.0 {TransferFinalCode} {(TransferFinalCode == 200 ? "OK" : "Busy Here")}", "terminated;reason=noresource"));
+                    string state = KeepReferSubscriptionActive ? "active;expires=60" : "terminated;reason=noresource";
+                    string reason = TransferFinalCode switch { 100 => "Trying", 200 => "OK", 404 => "Not Found", _ => "Busy Here" };
+                    await SendAsync(ReferNotify(request, $"SIP/2.0 {TransferFinalCode} {reason}", state));
                     if (NotifyBeforeReferResponse) await SendAsync(SipMessage.Response(request, 202, "Accepted"));
                     // RFC 3891: a successful INVITE with Replaces ends the replaced dialog; the PBX sends its BYE.
                     string referTo = Uri.UnescapeDataString(request.Get("Refer-To"));
