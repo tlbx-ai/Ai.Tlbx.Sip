@@ -66,17 +66,24 @@ try
             var music = Task.Run(async () =>
             {
                 var tone = Tone(440); var pause = new short[480];
-                try { for (int i = 0; !holdMusic.IsCancellationRequested; i++) { var frame = i % 50 < 25 ? tone : pause; while (!call.Audio.TryWrite(frame, 24000)) await Task.Delay(10, holdMusic.Token); } }
+                // Keep only a small lead in the transmit queue so the caller is not resumed behind seconds of tone.
+                try { for (int i = 0; !holdMusic.IsCancellationRequested; i++) { var frame = i % 50 < 25 ? tone : pause; while (call.Audio.QueuedAudio > TimeSpan.FromMilliseconds(100) || !call.Audio.TryWrite(frame, 24000)) await Task.Delay(10, holdMusic.Token); } }
                 catch (OperationCanceledException) { }
             });
-            var consultation = client.CreateCall(args[attendedIndex + 1]); Attach(consultation);
-            Console.WriteLine($"Call {call.Id}: consulting {args[attendedIndex + 1]} as {consultation.Id}");
-            using var ring = CancellationTokenSource.CreateLinkedTokenSource(stop.Token); ring.CancelAfter(TimeSpan.FromSeconds(20));
-            bool answered;
-            try { await consultation.StartAsync(ring.Token); answered = true; }
-            catch (Exception error) { answered = false; Console.WriteLine($"Call {call.Id}: consultation failed: {error.Message}"); }
-            if (answered)
+            // If the caller hangs up during a consultation, stop ringing the target at once.
+            using var callerGone = CancellationTokenSource.CreateLinkedTokenSource(stop.Token);
+            call.StatusChanged += (_, s) => { if (s.State == SipCallState.Ended) try { callerGone.Cancel(); } catch (ObjectDisposedException) { } };
+            // A comma-separated list is tried in order: the next target is consulted when one does not answer.
+            foreach (string target in args[attendedIndex + 1].Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
             {
+                if (call.Status.State != SipCallState.Established) break;
+                var consultation = client.CreateCall(target); Attach(consultation);
+                Console.WriteLine($"Call {call.Id}: consulting {target} as {consultation.Id}");
+                using var ring = CancellationTokenSource.CreateLinkedTokenSource(callerGone.Token); ring.CancelAfter(TimeSpan.FromSeconds(20));
+                bool answered;
+                try { await consultation.StartAsync(ring.Token); answered = true; }
+                catch (Exception error) { answered = false; Console.WriteLine($"Call {call.Id}: consultation failed: {error.Message}"); }
+                if (!answered) continue;
                 var announce = Tone(660);
                 for (int i = 0; i < 150; i++) while (!consultation.Audio.TryWrite(announce, 24000)) await Task.Delay(10, stop.Token);
                 await consultation.Audio.WaitForDrainAsync(TimeSpan.FromSeconds(5), stop.Token);
@@ -86,10 +93,34 @@ try
                 Console.WriteLine($"Call {call.Id}: attended transfer {result.Outcome} {result.StatusCode} {result.ReasonPhrase}");
                 if (result.Outcome == SipTransferOutcome.Succeeded) return;
                 await consultation.HangupAsync(stop.Token);
+                break;
             }
             holdMusic.Cancel(); await music;
+            if (call.Status.State != SipCallState.Established) { Console.WriteLine($"Call {call.Id}: caller gone, nothing to take back"); return; }
+            // Drop the remaining hold tone; otherwise everything sent after resuming lags behind it.
+            call.Audio.ClearOutput();
             Console.WriteLine($"Call {call.Id}: taking caller back"); await call.ResumeAsync(stop.Token);
             Console.WriteLine($"Call {call.Id}: caller back, local={call.Audio.Direction}");
+        }));
+        int twiceIndex = Array.IndexOf(args, "--refer-twice");
+        if (twiceIndex >= 0 && call.Direction == SipCallDirection.Incoming) operations.Add(ObserveAsync(async () =>
+        {
+            // Two REFERs in one dialog: the first target is expected to fail (for example a Replaces URI that
+            // matches no dialog), the second is a normal blind transfer. Shows whether the PBX NOTIFYs for the
+            // second subscription carry Event: refer;id=<CSeq> (RFC 3515 section 2.4.6).
+            while (call.Status.State is not (SipCallState.Established or SipCallState.Ended)) await Task.Delay(50, stop.Token);
+            if (call.Status.State == SipCallState.Ended) return;
+            await Task.Delay(TimeSpan.FromSeconds(5), stop.Token);
+            Console.WriteLine($"Call {call.Id}: first REFER to {args[twiceIndex + 1]}");
+            var first = await call.TransferAsync(args[twiceIndex + 1], stop.Token);
+            Console.WriteLine($"Call {call.Id}: first transfer {first.Outcome} {first.StatusCode} {first.ReasonPhrase}");
+            if (first.Outcome == SipTransferOutcome.Succeeded || call.Status.State != SipCallState.Established)
+            { Console.WriteLine($"Call {call.Id}: first transfer did not leave the call in place, test inconclusive"); return; }
+            await Task.Delay(TimeSpan.FromSeconds(3), stop.Token);
+            Console.WriteLine($"Call {call.Id}: second REFER to {args[twiceIndex + 2]}");
+            var watch = System.Diagnostics.Stopwatch.StartNew();
+            var second = await call.TransferAsync(args[twiceIndex + 2], stop.Token);
+            Console.WriteLine($"Call {call.Id}: second transfer {second.Outcome} {second.StatusCode} {second.ReasonPhrase} after {watch.Elapsed.TotalSeconds:F1}s");
         }));
         int transferIndex = Array.IndexOf(args, "--transfer-test");
         if (transferIndex >= 0) operations.Add(ObserveAsync(async () =>
